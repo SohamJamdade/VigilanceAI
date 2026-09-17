@@ -9,30 +9,37 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from model.transformer import FinancialSLM
 
 def run_inference(scenario_dict, model, tokenizer, device, max_new_tokens=200):
-    """
-    Encodes the input scenario with training boundary tokens and extracts
-    the generated AML investigation report.
-    """
-    # 1. Wrap the scenario inside special boundary tokens
     prompt_str = f"<|context_start|>{json.dumps(scenario_dict)}<|context_end|><|target_start|>"
     prompt_tokens = tokenizer.encode(prompt_str).ids
     input_ids = torch.tensor([prompt_tokens], dtype=torch.long, device=device)
+    
+    # Get ID of the end token
+    target_end_id = tokenizer.token_to_id("<|target_end|>")
 
-    # 2. Run autoregressive inference
     model.eval()
     with torch.no_grad():
-        out_ids = model.generate(input_ids, max_new_tokens=max_new_tokens, temperature=0.1)
+        # Step-by-step generation with early exit on stop token
+        curr_ids = input_ids
+        for _ in range(max_new_tokens):
+            idx_cond = curr_ids if curr_ids.size(1) <= model.max_seq_len else curr_ids[:, -model.max_seq_len:]
+            logits, _ = model(idx_cond)
+            logits = logits[:, -1, :] / 0.1
+            probs = torch.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+            
+            if target_end_id is not None and next_token.item() == target_end_id:
+                break
+                
+            curr_ids = torch.cat((curr_ids, next_token), dim=1)
 
-    decoded = tokenizer.decode(out_ids[0].tolist())
+    decoded = tokenizer.decode(curr_ids[0].tolist())
 
-    # 3. Cleanly slice out only the investigation report
     if "<|target_start|>" in decoded:
         response = decoded.split("<|target_start|>")[1]
         if "<|target_end|>" in response:
             response = response.split("<|target_end|>")[0]
         return response.strip()
     return decoded
-
 def evaluate_all():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("=" * 75)
