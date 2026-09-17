@@ -14,7 +14,7 @@ class RMSNorm(nn.Module):
         return x * torch.rsqrt(variance + self.eps) * self.weight
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, d_model: int = 256, n_heads: int = 8, max_seq_len: int = 512):
+    def __init__(self, d_model: int = 384, n_heads: int = 12, max_seq_len: int = 512):
         super().__init__()
         assert d_model % n_heads == 0, "d_model must be divisible by n_heads"
         self.n_heads = n_heads
@@ -44,7 +44,7 @@ class CausalSelfAttention(nn.Module):
         return self.out_proj(out)
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int = 256, n_heads: int = 8, max_seq_len: int = 512):
+    def __init__(self, d_model: int = 384, n_heads: int = 12, max_seq_len: int = 512):
         super().__init__()
         self.attn_norm = RMSNorm(d_model)
         self.attn = CausalSelfAttention(d_model, n_heads, max_seq_len)
@@ -61,7 +61,7 @@ class TransformerBlock(nn.Module):
         return x
 
 class FinancialSLM(nn.Module):
-    def __init__(self, vocab_size: int = 2048, d_model: int = 256, n_layers: int = 6, n_heads: int = 8, max_seq_len: int = 512):
+    def __init__(self, vocab_size: int = 2048, d_model: int = 384, n_layers: int = 8, n_heads: int = 12, max_seq_len: int = 512):
         super().__init__()
         self.max_seq_len = max_seq_len
         self.tok_embeddings = nn.Embedding(vocab_size, d_model)
@@ -99,7 +99,7 @@ class FinancialSLM(nn.Module):
 
         return logits, loss
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens=32, temperature=0.7):
+    def generate(self, idx, max_new_tokens=64, temperature=0.2):
         for _ in range(max_new_tokens):
             idx_cond = idx if idx.size(1) <= self.max_seq_len else idx[:, -self.max_seq_len:]
             logits, _ = self(idx_cond)

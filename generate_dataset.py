@@ -1,233 +1,288 @@
 ﻿import json
 import random
 import os
-from faker import Faker
 import numpy as np
+from faker import Faker
 
-fake = Faker('en_IN')
+fake = Faker(['en_IN', 'en_US', 'en_GB'])
 Faker.seed(42)
 random.seed(42)
 np.random.seed(42)
 
-SANCTIONED_CONFIGS = [
-    {"country": "IRAN", "root": "Iran", "benign_first": ["Kiran", "Mirana", "Irani", "Sirani"]},
-    {"country": "SYRIA", "root": "Syria", "benign_first": ["Suriya", "Surya", "Syriac"]},
-    {"country": "CUBA", "root": "Cuba", "benign_first": ["Yakub", "Kuber", "Cuban"]}
+# -------------------------------------------------------------
+# 1. ENTITY CONFIGURATIONS & HIGH-ENTROPY POOLS
+# -------------------------------------------------------------
+SANCTIONED_TARGETS = [
+    {
+        "jurisdiction": "IRAN",
+        "tokens": ["Iran", "Tehran", "Persia"],
+        "benign_names": ["Kiran Deshmukh", "Irani Marine Exports", "Mirana Rao", "Samiha Irani", "Kiran Patel"]
+    },
+    {
+        "jurisdiction": "SYRIA",
+        "tokens": ["Syria", "Damascus", "Levant"],
+        "benign_names": ["Surya Narayanan", "Suriya Logistics", "Syriac Thomas", "Suraj Sharma", "Surya Prakash"]
+    },
+    {
+        "jurisdiction": "CUBA",
+        "tokens": ["Cuba", "Havana"],
+        "benign_names": ["Yakub Merchant", "Kuber Enterprises", "Cuban Cafe Pune", "Akub Memon"]
+    },
+    {
+        "jurisdiction": "NORTH_KOREA",
+        "tokens": ["DPRK", "Pyongyang"],
+        "benign_names": ["Koryo Traders", "Parkash Kim", "Pyo Industries"]
+    },
+    {
+        "jurisdiction": "MYANMAR_SANCTIONED",
+        "tokens": ["Myanmar", "Yangon", "Burma"],
+        "benign_names": ["Mayur Marine", "Burman Brothers", "Yashwant Gore"]
+    }
 ]
 
-DOMESTIC_CITIES = ["Mumbai", "Pune", "Delhi", "Bengaluru", "Hyderabad", "Chennai"]
+CHANNELS = ["UPI", "NEFT", "RTGS", "IMPS", "SWIFT", "POS_MERCHANT", "CASH_DEPOSIT"]
+REGIONS = ["Mumbai", "Delhi", "Bengaluru", "Hyderabad", "Pune", "Chennai", "Kolkata", "Ahmedabad", "Jaipur", "Dubai", "London"]
 
-def generate_account_baseline(account_id):
-    median_amt = random.choice([1500, 3000, 5500, 12000, 25000])
-    home_city = random.choice(DOMESTIC_CITIES)
-    primary_device = f"DEV-{fake.hexify(text='^^^^^^^^')}"
-    return {
-        "account_id": account_id,
-        "customer_name": fake.name(),
-        "median_tx_amount": median_amt,
-        "typical_range": [int(median_amt * 0.2), int(median_amt * 2.5)],
-        "home_city": home_city,
-        "primary_device": primary_device,
-        "typical_tx_per_day": random.randint(2, 6)
+def shuffle_dict(d: dict) -> dict:
+    """Randomizes key order so the model cannot memorize fixed structural offsets."""
+    items = list(d.items())
+    random.shuffle(items)
+    return dict(items)
+
+# -------------------------------------------------------------
+# 2. DYNAMIC EVIDENCE SYNTHESIZERS
+# -------------------------------------------------------------
+def compose_structuring_evidence(count, ceiling, total, time_span):
+    templates = [
+        f"Detected {count} successive outbound transfers hovering within 5% beneath regulatory threshold of INR {ceiling:,}.",
+        f"Cumulative value of INR {total:,} split across {count} tranches to evade currency monitoring limits ({ceiling:,}).",
+        f"Smurfing pattern flagged: {count} sub-threshold transfers executed rapidly in {time_span} minutes.",
+        f"Deliberate tranche structuring identified: repetitive values near statutory reporting limit of INR {ceiling:,}."
+    ]
+    return random.sample(templates, k=random.randint(1, 2))
+
+def compose_counter_evidence(scenario_type, context):
+    if scenario_type == "mitigated":
+        phrasings = [
+            "Customer filed advance purchase notice for verified commercial capital expenditure.",
+            "Counterparty is an audited Category-A registered corporate entity.",
+            "Prior regulatory notice filed by account holder satisfies AML threshold exception.",
+            "Transaction originated strictly from verified primary authentication token and domestic IP."
+        ]
+        return random.sample(phrasings, k=random.randint(1, 3))
+    elif scenario_type == "benign_entity":
+        name = context.get("flagged_name", "Individual")
+        phrasings = [
+            f"Entity resolution verifies '{name}' is an individual citizen with zero sanctioned ownership linkage.",
+            "Domestic jurisdiction confirmed; transactional node routes solely through authorized domestic clearing.",
+            "Watchlist match determined to be a phonetic false-positive following national ID verification."
+        ]
+        return random.sample(phrasings, k=random.randint(1, 2))
+    return []
+
+# -------------------------------------------------------------
+# 3. CORE SCENARIO BUILDERS
+# -------------------------------------------------------------
+def build_dynamic_normal(idx):
+    median = int(np.random.choice([1500, 3500, 7500, 16000, 38000, 85000]))
+    home = random.choice(REGIONS[:8])
+    device = f"DEV-{fake.hexify('^^^^^^^^')}"
+    
+    account = {
+        "account_id": f"ACC-{idx:05d}",
+        "customer": fake.name(),
+        "historical_median": median,
+        "typical_bracket": [int(median * 0.15), int(median * 2.3)],
+        "registered_city": home,
+        "primary_device": device
     }
 
-def build_scenario_normal(account):
-    tx_count = random.randint(1, 3)
+    tx_count = random.randint(1, 4)
     txs = []
     for _ in range(tx_count):
+        amt = int(np.random.uniform(account["typical_bracket"][0], account["typical_bracket"][1]))
         txs.append({
-            "tx_id": f"TX-{random.randint(10000, 99999)}",
-            "amount": int(np.random.uniform(account["typical_range"][0], account["typical_range"][1])),
+            "tx_id": f"TXN-{fake.hexify('^^^^^^')}",
+            "amount": amt,
+            "rail": random.choice(CHANNELS),
             "recipient": fake.name(),
-            "recipient_type": "PERSON",
-            "location": account["home_city"],
-            "device_id": account["primary_device"],
-            "timestamp": f"1{random.randint(0, 8)}:{random.randint(10, 59)}:00"
+            "location": home if random.random() > 0.15 else random.choice(REGIONS),
+            "device": device if random.random() > 0.10 else f"DEV-{fake.hexify('^^^^^^^^')}",
+            "time": f"{random.randint(7, 22):02d}:{random.randint(0, 59):02d}"
         })
-    
-    context = {
-        "account_baseline": account,
-        "transactions": txs,
-        "network_edges": [],
-        "retrieved_policies": ["POL-AML-01: Standard threshold monitoring."]
-    }
-    
-    target = {
+
+    context = shuffle_dict({
+        "account_baseline": shuffle_dict(account),
+        "activity_batch": txs,
+        "active_rules": ["POL-DEFAULT-MONITOR: Flag transactions breaching 3.5x baseline."]
+    })
+
+    target = shuffle_dict({
         "risk_level": "LOW",
-        "primary_typology": "NONE",
-        "supporting_evidence": ["All transactions within 30-day baseline range", "Recognized primary device and geo-location"],
-        "counter_evidence": ["Standard temporal intervals observed"],
-        "recommended_action": "CLEAR"
-    }
+        "primary_typology": "NORMAL_ROUTINE",
+        "supporting_evidence": ["All transactions conform strictly to customer historical baseline and velocity parameters."],
+        "counter_evidence": ["Standard temporal intervals and verified primary device authentication observed."],
+        "recommended_action": "AUTO_CLEAR"
+    })
     return context, target
 
-def build_scenario_mitigated_anomaly(account):
-    multiplier = random.randint(12, 28)
-    spike_amt = account["median_tx_amount"] * multiplier
-    merchant_name = f"{fake.company()} {random.choice(['Motors', 'Jewellers', 'Enterprises', 'Luxury Retail'])}"
+def build_dynamic_structuring(idx):
+    ceiling = int(random.choice([20000, 50000, 100000, 250000, 500000]))
+    count = random.randint(3, 6)
+    time_span = random.randint(3, 20)
     
-    txs = [{
-        "tx_id": f"TX-{random.randint(10000, 99999)}",
-        "amount": spike_amt,
-        "recipient": merchant_name,
-        "recipient_type": "MERCHANT_VERIFIED",
-        "location": account["home_city"],
-        "device_id": account["primary_device"],
-        "timestamp": f"{random.randint(10, 18)}:{random.randint(10, 59)}:10"
-    }]
+    # Values hover 0.8% to 4.5% below the statutory limit
+    amounts = [ceiling - int(ceiling * random.uniform(0.008, 0.045)) for _ in range(count)]
+    total = sum(amounts)
     
-    context = {
-        "account_baseline": account,
-        "transactions": txs,
-        "network_edges": [],
-        "documented_counter_evidence": [
-            "Customer filed advance purchase notice for high-value acquisition",
-            "Merchant is an audited Category-A registered entity"
-        ],
-        "retrieved_policies": ["POL-ANOM-202: High-value transaction review thresholds."]
-    }
-    
-    target = {
-        "risk_level": "MEDIUM",
-        "primary_typology": "EXPLAINABLE_HIGH_VALUE",
-        "supporting_evidence": [f"Single amount INR {spike_amt} deviates >{multiplier}x from median"],
-        "counter_evidence": [
-            "Prior customer documentation matches transaction category",
-            "Merchant is an audited corporate entity",
-            "Originated from primary device in home city"
-        ],
-        "recommended_action": "VERIFY_DOCUMENTATION"
-    }
-    return context, target
-
-def build_scenario_adversarial_entity(account):
-    config = random.choice(SANCTIONED_CONFIGS)
-    is_malicious = random.choice([True, False])
-    
-    if is_malicious:
-        tx_amt = random.randint(45000, 150000)
-        recipient = f"{fake.city()} {config['root']} Trading LLC"
-        tx = {
-            "tx_id": f"TX-{random.randint(10000, 99999)}",
-            "amount": tx_amt,
-            "recipient": recipient,
-            "recipient_type": "ORGANIZATION",
-            "jurisdiction": config["country"],
-            "device_id": account["primary_device"],
-            "timestamp": f"{random.randint(9, 17)}:05:00"
-        }
-        target = {
-            "risk_level": "CRITICAL",
-            "primary_typology": "SANCTIONS_VIOLATION",
-            "supporting_evidence": [f"Direct wire to restricted jurisdiction: {config['country']}", f"Recipient {recipient} flagged on international watchlists"],
-            "counter_evidence": [],
-            "recommended_action": "FREEZE_AND_ESCALATE"
-        }
-    else:
-        benign_name = f"{random.choice(config['benign_first'])} {fake.last_name()}"
-        tx_amt = int(account["median_tx_amount"] * random.uniform(0.8, 1.6))
-        tx = {
-            "tx_id": f"TX-{random.randint(10000, 99999)}",
-            "amount": tx_amt,
-            "recipient": benign_name,
-            "recipient_type": "INDIVIDUAL_PERSON",
-            "jurisdiction": "INDIA",
-            "device_id": account["primary_device"],
-            "timestamp": f"{random.randint(9, 17)}:05:00"
-        }
-        target = {
-            "risk_level": "LOW",
-            "primary_typology": "BENIGN_ENTITY_OVERLAP",
-            "supporting_evidence": [f"Substring match with {config['root']} token detected by rules engine"],
-            "counter_evidence": [
-                f"Entity resolution confirms recipient is an individual citizen ({benign_name})",
-                "Transaction jurisdiction is domestic (INDIA)",
-                "Amount consistent with baseline"
-            ],
-            "recommended_action": "DISMISS_FALSE_POSITIVE"
-        }
-
-    context = {
-        "account_baseline": account,
-        "transactions": [tx],
-        "network_edges": [],
-        "retrieved_policies": ["POL-SANC-01: Freeze on transactions linked to prohibited jurisdictions."]
-    }
-    return context, target
-
-def build_scenario_structuring(account):
-    ceiling = random.choice([50000, 100000])
-    num_txs = random.randint(3, 5)
-    base_minute = random.randint(5, 30)
+    acct_id = f"ACC-{idx:05d}"
+    beneficiary = f"BENEF-{random.randint(100, 999)}"
     
     txs = []
-    total_amount = 0
-    for i in range(num_txs):
-        # Generate randomized amounts 1% to 4% beneath the statutory ceiling
-        amt = ceiling - random.randint(500, 2200)
-        total_amount += amt
+    for i, amt in enumerate(amounts):
         txs.append({
-            "tx_id": f"TX-{random.randint(10000, 99999)}",
+            "tx_id": f"TXN-{fake.hexify('^^^^^^')}",
             "amount": amt,
-            "recipient": f"ACC-{random.randint(800, 999)}",
-            "recipient_type": "INTERMEDIARY",
-            "location": random.choice(DOMESTIC_CITIES),
-            "device_id": f"DEV-UNSEEN-{i}",
-            "timestamp": f"03:{base_minute + (i * 2):02d}:15"
+            "rail": random.choice(["IMPS", "UPI", "NEFT"]),
+            "recipient": beneficiary,
+            "device": f"DEV-UNMAPPED-{random.randint(10, 99)}",
+            "time": f"03:{random.randint(10, 40) + (i * 2):02d}:00"
         })
-        
-    context = {
-        "account_baseline": account,
-        "transactions": txs,
-        "network_edges": [f"{account['account_id']} -> {tx['recipient']}" for tx in txs],
-        "retrieved_policies": [
-            f"POL-AML-40: Mandatory reporting on structuring transactions hovering below INR {ceiling:,} threshold."
-        ]
-    }
-    
-    target = {
+
+    context = shuffle_dict({
+        "subject_account": acct_id,
+        "batch_records": txs,
+        "statutory_limit": ceiling,
+        "network_edges": [f"{acct_id} -> {beneficiary}"],
+        "applied_policy": f"POL-STRUC-REG: Mandatory escalation for deliberate threshold avoidance near INR {ceiling:,}."
+    })
+
+    target = shuffle_dict({
         "risk_level": "HIGH",
         "primary_typology": "STRUCTURING_SMURFING",
-        "supporting_evidence": [
-            f"{num_txs} consecutive transfers under INR {ceiling:,} ceiling totaling INR {total_amount:,}",
-            f"Execution velocity: {num_txs} transactions in {num_txs * 2} minutes",
-            "Unrecognized devices and off-hours execution (03:00 AM)"
-        ],
+        "supporting_evidence": compose_structuring_evidence(count, ceiling, total, time_span),
         "counter_evidence": [],
-        "recommended_action": "INVESTIGATOR_REVIEW"
-    }
+        "recommended_action": "ESCALATE_TO_FIU"
+    })
     return context, target
 
-def generate_master_dataset(total_samples=5000):
+def build_dynamic_adversarial(idx):
+    cfg = random.choice(SANCTIONED_TARGETS)
+    is_malicious = random.random() < 0.5
+    
+    if is_malicious:
+        entity = f"{fake.company()} {random.choice(cfg['tokens'])} Forwarders"
+        jurisdiction = cfg["jurisdiction"]
+        risk = "CRITICAL"
+        action = "BLOCK_IMMEDIATELY"
+        typology = "SANCTIONS_BREACH"
+        indicators = [f"Direct transshipment or funds transfer linked to restricted jurisdiction: {jurisdiction}."]
+        mitigations = []
+    else:
+        entity = f"{random.choice(cfg['benign_names'])}"
+        jurisdiction = "INDIA"
+        risk = "LOW"
+        action = "DISMISS_FALSE_ALARM"
+        typology = "BENIGN_PHONETIC_MATCH"
+        indicators = [f"Lexical overlap detected with restricted jurisdiction keyword '{random.choice(cfg['tokens'])}'."]
+        mitigations = compose_counter_evidence("benign_entity", {"flagged_name": entity})
+
+    tx = {
+        "tx_id": f"TXN-{fake.hexify('^^^^^^')}",
+        "amount": random.randint(25000, 850000),
+        "recipient": entity,
+        "jurisdiction": jurisdiction,
+        "rail": "SWIFT" if is_malicious else random.choice(CHANNELS)
+    }
+
+    context = shuffle_dict({
+        "audit_account": f"ACC-{idx:05d}",
+        "transaction_event": tx,
+        "compliance_policy": "SANCTIONS-SCREEN-01: Freeze funds destined for high-risk embargoed jurisdictions."
+    })
+
+    target = shuffle_dict({
+        "risk_level": risk,
+        "primary_typology": typology,
+        "supporting_evidence": indicators,
+        "counter_evidence": mitigations,
+        "recommended_action": action
+    })
+    return context, target
+
+def build_dynamic_mitigated(idx):
+    median = int(np.random.choice([2500, 5500, 12000, 30000]))
+    mult = random.randint(14, 30)
+    spike_amt = median * mult
+    vendor = f"{fake.company()} Heavy Industries Ltd"
+    home = random.choice(REGIONS[:6])
+    device = f"DEV-{fake.hexify('^^^^^^^^')}"
+
+    acct = {
+        "account_id": f"ACC-{idx:05d}",
+        "customer": fake.name(),
+        "median_tx_amount": median,
+        "registered_city": home,
+        "primary_device": device
+    }
+
+    tx = {
+        "tx_id": f"TXN-{fake.hexify('^^^^^^')}",
+        "amount": spike_amt,
+        "recipient": vendor,
+        "rail": "RTGS",
+        "location": home,
+        "device": device,
+        "time": "14:15:00"
+    }
+
+    context = shuffle_dict({
+        "account_baseline": acct,
+        "transaction_event": tx,
+        "documented_justifications": [
+            "Advance tax invoice and statutory declaration filed prior to execution.",
+            "Counterparty is an audited Category-A verified corporate entity."
+        ],
+        "applied_policy": "POL-SPIKE-102: Flag isolated transactions breaching 10x median baseline."
+    })
+
+    target = shuffle_dict({
+        "risk_level": "MEDIUM",
+        "primary_typology": "EXPLAINABLE_HIGH_VALUE",
+        "supporting_evidence": [f"Single wire of INR {spike_amt:,} deviates {mult}x from historical median."],
+        "counter_evidence": compose_counter_evidence("mitigated", {}),
+        "recommended_action": "VERIFY_DOCUMENTATION"
+    })
+    return context, target
+
+# -------------------------------------------------------------
+# 4. MASTER 50K COMPILATION
+# -------------------------------------------------------------
+def generate_dataset(samples=50000):
     os.makedirs("data", exist_ok=True)
-    out_file = "data/financial_risk_corpus.jsonl"
-    print(f"Generating {total_samples} dynamic synthetic scenarios...")
+    target_path = "data/financial_risk_corpus.jsonl"
+    print(f"Synthesizing {samples:,} high-entropy financial scenarios...")
 
-    with open(out_file, "w", encoding="utf-8") as f:
-        for i in range(total_samples):
-            acct = generate_account_baseline(f"ACC-{i:05d}")
-            scenario_type = random.choices(
-                ["normal", "mitigated", "adversarial_entity", "structuring"],
-                weights=[0.40, 0.20, 0.20, 0.20]
-            )[0]
-            
-            if scenario_type == "normal":
-                context, target = build_scenario_normal(acct)
-            elif scenario_type == "mitigated":
-                context, target = build_scenario_mitigated_anomaly(acct)
-            elif scenario_type == "adversarial_entity":
-                context, target = build_scenario_adversarial_entity(acct)
-            else:
-                context, target = build_scenario_structuring(acct)
+    generators = [
+        (build_dynamic_normal, 0.35),
+        (build_dynamic_structuring, 0.25),
+        (build_dynamic_adversarial, 0.25),
+        (build_dynamic_mitigated, 0.15)
+    ]
+    funcs, weights = zip(*generators)
 
+    with open(target_path, "w", encoding="utf-8") as f:
+        for idx in range(samples):
+            fn = random.choices(funcs, weights=weights)[0]
+            ctx, tgt = fn(idx)
             record = {
-                "scenario_id": f"SCN-{i:06d}",
-                "input_context": context,
-                "investigation_target": target
+                "scenario_id": f"SCN-{idx:06d}",
+                "input_context": ctx,
+                "investigation_target": tgt
             }
             f.write(json.dumps(record) + "\n")
 
-    print(f"Dataset generated successfully at {out_file} ({total_samples} samples).")
+    print(f"Generation complete: {target_path} successfully saved ({samples:,} records).")
 
 if __name__ == "__main__":
-    generate_master_dataset(total_samples=5000)
+    generate_dataset(50000)
