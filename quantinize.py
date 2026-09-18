@@ -30,7 +30,7 @@ def quantinize_model():
     ).to("cpu")
 
     #load trained FP32 wwights 
-    model_fp32.load_state_dict(torch.load(checkpoint_fp32 ,map_loaction ="cpu"))
+    model_fp32.load_state_dict(torch.load(checkpoint_fp32, map_location="cpu", weights_only=True))
     model_fp32.eval()
 
     fp32_size_mb = os.path.getsize(checkpoint_fp32) / (1024 *1024)
