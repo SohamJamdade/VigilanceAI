@@ -5,7 +5,7 @@ import json
 import torch
 from tokenizers import Tokenizer
 
-sys.pat.append(os.path.abspath(os.path.dirname(__file__)))
+sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 from model.transformer import FinancialSLM 
 
 def quantinize_model():
