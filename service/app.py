@@ -56,6 +56,26 @@ def log_audit_record(account: str, decision: dict, payload: dict):
         ))
         conn.commit()
 
+def normalize_decision_keys(d: dict) -> dict:
+    """Recursively strips whitespace from dictionary keys and string values."""
+    if not  isinstance(d, dict):
+        return d 
+    cleaned = {}
+    for k, v in d.items():
+        clean_k =k.strip()
+        if isinstance(v, dict):
+            cleaned[clean_k] = normalize_decision_keys(v)
+        elif isinstance(v, str):
+            cleaned[clean_k] = v.strip()
+        elif isinstance(v, list):
+            cleaned[clean_k] = [
+                x.strip() if isinstance(x, str) else normalize_decision_keys(x) if isinstance(x, dict) else x 
+                for x in v
+            ]
+        else:
+            cleaned[clean_k] = v
+    return cleaned
+                
 # FastAPI Lifespan and Model State
 runtime_state: Dict[str, Any] = {}
 
@@ -130,6 +150,8 @@ async def screen_transaction(payload: Dict[str, Any]):
             "supporting_evidence": ["Parsing artifact detected. Flagged for review."]
         }
 
+    parsed_decision =normalize_decision_keys(parsed_decision)
+    
     # Extract account ID and persist directly to audit DB
     account_id = payload.get("subject_account") or payload.get("account_baseline", {}).get("account_id", "UNKNOWN")
     log_audit_record(account_id, parsed_decision, payload)
