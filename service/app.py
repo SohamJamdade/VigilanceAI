@@ -98,7 +98,7 @@ async def lifespan(app: FastAPI):
         base_model, {torch.nn.Linear}, dtype=torch.qint8
     )
     quantized_model.load_state_dict(
-        torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        torch.load(ckpt_path, map_location="cpu", weights_only=False)
     )
     quantized_model.eval()
 
@@ -114,7 +114,7 @@ app = FastAPI(title="VigilanceAI AML Platform", version="1.1.0", lifespan=lifesp
 @app.post("/v1/screen", status_code=status.HTTP_200_OK)
 async def screen_transaction(payload: Dict[str, Any]):
     model = runtime_state["model"]
-    tokenizer = runtime_state["tokenizer"]
+    tokenizer = runtime_state["tokenizer"] 
     target_end_id = runtime_state["target_end_id"]
 
     prompt_str = f"<|context_start|>{json.dumps(payload)}<|context_end|><|target_start|>"
