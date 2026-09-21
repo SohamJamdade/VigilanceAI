@@ -4,3 +4,5 @@ pydantic>=2.6.0
 tokenizers>=0.15.0
 torch==2.2.2 --extra-index-url https://download.pytorch.org/whl/cpu
 requests>=2.31.0
+thefuzz>=0.22.0
+python-Levenshtein>=0.25.0

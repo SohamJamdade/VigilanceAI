@@ -12,12 +12,14 @@ from fastapi import FastAPI, HTTPException, status
 from pydantic import BaseModel
 import torch
 from tokenizers import Tokenizer
+from thefuzz import fuzz, process
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from model.transformer import FinancialSLM
 
-
-# Database Setup (Default: Built-in SQLite, seamlessly swappable to PostgreSQL)
+# ---------------------------------------------------------
+# Database Setup (SQLite persistence)
+# ---------------------------------------------------------
 DB_FILE = "audit_log.db"
 
 def init_db():
@@ -58,11 +60,11 @@ def log_audit_record(account: str, decision: dict, payload: dict):
 
 def normalize_decision_keys(d: dict) -> dict:
     """Recursively strips whitespace from dictionary keys and string values."""
-    if not  isinstance(d, dict):
+    if not isinstance(d, dict):
         return d 
     cleaned = {}
     for k, v in d.items():
-        clean_k =k.strip()
+        clean_k = k.strip()
         if isinstance(v, dict):
             cleaned[clean_k] = normalize_decision_keys(v)
         elif isinstance(v, str):
@@ -75,13 +77,15 @@ def normalize_decision_keys(d: dict) -> dict:
         else:
             cleaned[clean_k] = v
     return cleaned
-                
+
+# ---------------------------------------------------------
 # FastAPI Lifespan and Model State
+# ---------------------------------------------------------
 runtime_state: Dict[str, Any] = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_db()  # Auto-initialize database on startup
+    init_db()
     torch.set_num_threads(4)
     tok_path = "tokenizer/financial_bpe.json"
     ckpt_path = "checkpoints/slm_15m_int8.pt"
@@ -108,9 +112,12 @@ async def lifespan(app: FastAPI):
     yield
     runtime_state.clear()
 
+# Initialize FastAPI App First (Must precede route decorators)
 app = FastAPI(title="VigilanceAI AML Platform", version="1.1.0", lifespan=lifespan)
 
-# 1. Existing Transaction Screening Route (Now Auto-logging to DB)
+# ---------------------------------------------------------
+# Route 1: Transaction Screening Engine
+# ---------------------------------------------------------
 @app.post("/v1/screen", status_code=status.HTTP_200_OK)
 async def screen_transaction(payload: Dict[str, Any]):
     model = runtime_state["model"]
@@ -150,9 +157,8 @@ async def screen_transaction(payload: Dict[str, Any]):
             "supporting_evidence": ["Parsing artifact detected. Flagged for review."]
         }
 
-    parsed_decision =normalize_decision_keys(parsed_decision)
+    parsed_decision = normalize_decision_keys(parsed_decision)
     
-    # Extract account ID and persist directly to audit DB
     account_id = payload.get("subject_account") or payload.get("account_baseline", {}).get("account_id", "UNKNOWN")
     log_audit_record(account_id, parsed_decision, payload)
 
@@ -162,71 +168,123 @@ async def screen_transaction(payload: Dict[str, Any]):
         "decision": parsed_decision
     }
 
-# 2. Bank Employee Conversational Query Endpoint
+# ---------------------------------------------------------
+# Route 2: Typo-Tolerant Conversational Assistant
+# ---------------------------------------------------------
 class ChatQuery(BaseModel):
     query: str
 
+def extract_account_id(query: str, cursor: sqlite3.Cursor) -> Optional[str]:
+    """Finds exact or approximate account IDs matching accounts in the database."""
+    rx_match = re.search(r'(?i)\b(?:acc[-_ ]?)?(\d{4,6})\b', query)
+    
+    cursor.execute("SELECT DISTINCT subject_account FROM screening_audit")
+    known_accounts = [row[0] for row in cursor.fetchall() if row[0]]
+    
+    if not known_accounts:
+        return None
+
+    if rx_match:
+        digits = rx_match.group(1)
+        for acc in known_accounts:
+            if digits in acc:
+                return acc
+
+    best_match, score = process.extractOne(query, known_accounts, scorer=fuzz.partial_ratio)
+    if score >= 75:
+        return best_match
+    return None
+
+def detect_query_intent(query: str) -> str:
+    """Classifies user intent even with spelling errors using token sort ratios."""
+    q = query.lower()
+    
+    intents = {
+        "count_flagged": ["how many flagged", "count suspicious", "total alerts", "number of risks", "how many high"],
+        "recent_activity": ["show recent", "latest transactions", "what happened recently", "newest alerts", "recent audit"],
+        "account_investigation": ["why is account flagged", "tell me about account", "explain alert", "check details", "reason for risk"],
+        "list_high_risk": ["which accounts are flagged", "list suspicious accounts", "who got flagged", "show all high risk"]
+    }
+    
+    best_intent = "unknown"
+    highest_score = 0
+    
+    for intent, sample_phrases in intents.items():
+        for phrase in sample_phrases:
+            score = fuzz.token_set_ratio(q, phrase)
+            if score > highest_score:
+                highest_score = score
+                best_intent = intent
+                
+    return best_intent if highest_score >= 60 else "unknown"
+
 @app.post("/v1/chat")
 def compliance_assistant_chat(req: ChatQuery):
-    """
-    Conversational assistant for compliance officers.
-    Answers natural language queries about flags, statistics, and specific accounts.
-    """
-    q = req.query.lower().strip()
+    raw_query = req.query.strip()
     
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
+        target_account = extract_account_id(raw_query, cursor)
+        intent = detect_query_intent(raw_query)
 
-        # Query Type 1: Overall flagged account counts
-        if "how many" in q and ("flag" in q or "high" in q or "suspicious" in q):
-            cursor.execute("SELECT COUNT(*) FROM screening_audit WHERE risk_level = 'HIGH'")
-            high_count = cursor.fetchone()[0]
-            cursor.execute("SELECT COUNT(*) FROM screening_audit")
-            total_count = cursor.fetchone()[0]
-            return {
-                "response": f"Currently, there are {high_count} HIGH-risk flagged accounts out of {total_count} total screened accounts."
-            }
-
-        # Query Type 2: Details on a specific account
-        match = re.search(r'acc-\d+', q)
-        if match:
-            target_acc = match.group(0).upper()
+        if target_account:
             cursor.execute(
                 "SELECT timestamp, risk_level, primary_typology, recommended_action, evidence_summary "
-                "FROM screening_audit WHERE UPPER(subject_account) = ? ORDER BY id DESC LIMIT 1",
-                (target_acc,)
+                "FROM screening_audit WHERE subject_account = ? ORDER BY id DESC LIMIT 1",
+                (target_account,)
             )
             row = cursor.fetchone()
             if row:
-                ts, risk, typology, action, evidence = row
+                ts, risk, typology, action, evidence_raw = row
+                try:
+                    evidence_list = json.loads(evidence_raw)
+                    evidence_str = "; ".join(evidence_list) if isinstance(evidence_list, list) else str(evidence_list)
+                except Exception:
+                    evidence_str = str(evidence_raw)
+
                 return {
                     "response": (
-                        f"Account {target_acc} was evaluated on {ts}.\n"
-                        f"• Risk Level: {risk}\n"
-                        f"• Typology: {typology}\n"
-                        f"• Recommended Action: {action}\n"
-                        f"• Evidence: {evidence}"
+                        f"Account {target_account} was evaluated on {ts}. "
+                        f"Risk Level: {risk}. "
+                        f"Typology: {typology}. "
+                        f"Action: {action}. "
+                        f"Evidence: {evidence_str}"
                     )
                 }
-            else:
-                return {"response": f"No audit records found for account ID '{target_acc}'."}
 
-        # Query Type 3: Summary of recent high-risk escalations
-        if "recent" in q or "summary" in q or "latest" in q:
-            cursor.execute(
-                "SELECT subject_account, primary_typology, risk_level FROM screening_audit "
-                "ORDER BY id DESC LIMIT 5"
-            )
-            recent_rows = cursor.fetchall()
-            if not recent_rows:
-                return {"response": "No recent transaction activity recorded yet."}
-            
-            summary_lines = [f"- {acc}: {typology} ({risk})" for acc, typology, risk in recent_rows]
+        if intent == "count_flagged":
+            cursor.execute("SELECT COUNT(*) FROM screening_audit WHERE risk_level = 'HIGH'")
+            high_count = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM screening_audit")
+            total = cursor.fetchone()[0]
             return {
-                "response": "Here are the most recent transaction reviews:\n" + "\n".join(summary_lines)
+                "response": f"Currently, there are {high_count} HIGH-risk flagged accounts out of {total} total screened accounts."
+            }
+
+        if intent == "list_high_risk":
+            cursor.execute("SELECT DISTINCT subject_account, primary_typology FROM screening_audit WHERE risk_level = 'HIGH' LIMIT 10")
+            rows = cursor.fetchall()
+            if not rows:
+                return {"response": "There are currently no accounts flagged as HIGH risk."}
+            items = [f"• {acc} ({typology})" for acc, typology in rows]
+            return {
+                "response": "The following accounts are currently flagged for review:\n" + "\n".join(items)
+            }
+
+        if intent == "recent_activity":
+            cursor.execute("SELECT subject_account, primary_typology, risk_level FROM screening_audit ORDER BY id DESC LIMIT 5")
+            rows = cursor.fetchall()
+            if not rows:
+                return {"response": "No transaction activity recorded yet."}
+            items = [f"• {acc}: {typology} [{risk}]" for acc, typology in rows]
+            return {
+                "response": "Here is the most recent activity:\n" + "\n".join(items)
             }
 
     return {
-        "response": "I can help with compliance statistics or account investigations. Try asking: "
-                    "'How many accounts are flagged?', 'Tell me about ACC-99104', or 'Show recent activity'."
+        "response": (
+            "I'm your compliance assistant. Ask me questions naturally, such as: "
+            "'Which accounts are flagged?', 'Why is ACC-78104 flagged?', 'How many alerts are there?', "
+            "or 'Show recent activity'."
+        )
     }
