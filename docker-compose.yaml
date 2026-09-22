@@ -1,0 +1,52 @@
+version: "3.8"
+
+services:
+  # FastAPI Backend (your existing API)
+  api:
+    build: .
+    container_name: vigilance-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - audit_data:/app/audit_log.db
+      - ./incoming:/app/incoming
+      - ./processed:/app/processed
+    environment:
+      - OMP_NUM_THREADS=4
+      - MKL_NUM_THREADS=4
+    restart: unless-stopped
+
+  # Streamlit Dashboard
+  dashboard:
+    build: .
+    container_name: vigilance-dashboard
+    ports:
+      - "8501:8501"
+    volumes:
+      - audit_data:/app/audit_log.db
+    environment:
+      - VIGILANCE_API_URL=http://api:8000
+      - VIGILANCE_DB=/app/audit_log.db
+    command: ["streamlit", "run", "service/dashboard.py", "--server.port=8501", "--server.address=0.0.0.0", "--server.headless=true"]
+    depends_on:
+      - api
+    restart: unless-stopped
+
+  # File Watcher (optional — auto-screens files dropped into incoming/)
+  watcher:
+    build: .
+    container_name: vigilance-watcher
+    volumes:
+      - ./incoming:/app/incoming
+      - ./processed:/app/processed
+    environment:
+      - VIGILANCE_API_URL=http://api:8000
+      - VIGILANCE_INCOMING=/app/incoming
+      - VIGILANCE_PROCESSED=/app/processed
+    command: ["python", "-m", "service.watcher"]
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  audit_data:

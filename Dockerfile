@@ -1,10 +1,11 @@
-from python:3.11-slim
+FROM python:3.11-slim
 
 WORKDIR /app
+
+# Install build dependencies for C-extensions (Levenshtein, tokenizers)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    python3-dev \
-    python3-pip \
+    gcc \
+    g++ \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
@@ -16,8 +17,5 @@ COPY model/ model/
 COPY service/ service/
 
 EXPOSE 8000
-
-ENV OMP_NUM_THREADS=4
-ENV MKL_NUM_THREADS=4
 
 CMD ["uvicorn", "service.app:app", "--host", "0.0.0.0", "--port", "8000"]

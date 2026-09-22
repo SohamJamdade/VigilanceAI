@@ -24,8 +24,10 @@ DB_FILE = "audit_log.db"
 
 def init_db():
     """Initializes the audit log table if it does not already exist."""
-    with sqlite3.connect(DB_FILE) as conn:
+    with sqlite3.connect(DB_FILE, timeout=5.0) as conn:
         cursor = conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL;")
+        cursor.execute("PRAGMA busy_timeout=5000;")
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS screening_audit (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -42,7 +44,7 @@ def init_db():
 
 def log_audit_record(account: str, decision: dict, payload: dict):
     """Saves every SLM evaluation into the database for compliance and chat querying."""
-    with sqlite3.connect(DB_FILE) as conn:
+    with sqlite3.connect(DB_FILE, timeout=5.0) as conn:
         cursor = conn.cursor()
         cursor.execute("""
             INSERT INTO screening_audit 
@@ -81,7 +83,7 @@ def normalize_decision_keys(d: dict) -> dict:
 def get_account_history(account: str) -> list:
     """Retrieves all previous batch records stored for this account."""
     accumulated_txs = []
-    with sqlite3.connect(DB_FILE) as conn:
+    with sqlite3.connect(DB_FILE, timeout=5.0) as conn:
         cursor = conn.cursor()
         cursor.execute(
             "SELECT raw_payload FROM screening_audit WHERE UPPER(subject_account) = ? ORDER BY id ASC",
@@ -131,7 +133,7 @@ async def lifespan(app: FastAPI):
     yield
     runtime_state.clear()
 
-# Initialize FastAPI App First (Must precede route decorators)
+# Initialize FastAPI App
 app = FastAPI(title="VigilanceAI AML Platform", version="1.1.0", lifespan=lifespan)
 
 # ---------------------------------------------------------
@@ -151,7 +153,7 @@ async def screen_transaction(payload: Dict[str, Any]):
     eval_payload["batch_records"] = combined_records
 
     model = runtime_state["model"]
-    tokenizer = runtime_state["tokenizer"]
+    tokenizer = runtime_state["tokenizer"] 
     target_end_id = runtime_state["target_end_id"]
 
     prompt_str = f"<|context_start|>{json.dumps(eval_payload)}<|context_end|><|target_start|>"
@@ -189,8 +191,8 @@ async def screen_transaction(payload: Dict[str, Any]):
 
     parsed_decision = normalize_decision_keys(parsed_decision)
 
-    # 3. Log the new evaluation without overwriting past entries
-    log_audit_record(account_id, parsed_decision, eval_payload)
+    # 3. Log cumulative payload so context compounds over time
+    log_audit_record(account_id, parsed_decision,payload)
 
     return {
         "status": "success",
@@ -200,7 +202,55 @@ async def screen_transaction(payload: Dict[str, Any]):
     }
 
 # ---------------------------------------------------------
-# Route 2: Typo-Tolerant Conversational Assistant
+# Route 2: Automated Event Ingestion
+# ---------------------------------------------------------
+class SingleTransactionEvent(BaseModel):
+    account_id: str
+    tx_id: str 
+    amount: float 
+    rail: str = "IMPS"
+    recipient: str 
+    device_id: str = "DEV-MOBILE"
+    statutory_limit: float = 50000.0  # Kept standard at INR 50k
+
+DEFAULT_AML_POLICY = (
+    "POL-CORE-AML: Identify structuring, sudden velocity spikes, "
+    "and transactions hovering immediately beneath statutory thresholds."
+)
+
+@app.post("/v1/ingest", status_code=status.HTTP_200_OK)
+async def ingest_transaction(event: SingleTransactionEvent):
+    """
+    Simulates core banking webhook:
+    Transforms raw transfer attributes into cumulative screening batches automatically.
+    """
+    new_record = {
+        "tx_id": event.tx_id,
+        "amount": event.amount,
+        "rail": event.rail,
+        "recipient": event.recipient,
+        "device": event.device_id,
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+    slm_payload = {
+        "subject_account": event.account_id,
+        "statutory_limit": event.statutory_limit,
+        "batch_records": [new_record],
+        "applied_policy": DEFAULT_AML_POLICY
+    }
+
+    screen_response = await screen_transaction(slm_payload)
+    
+    return {
+        "status": "ingested_and_evaluated",
+        "account_id": event.account_id,
+        "total_historical_txs": screen_response["total_account_tx_count"],
+        "latest_decision": screen_response["decision"]
+    }
+
+# ---------------------------------------------------------
+# Route 3: Typo-Tolerant Conversational Assistant
 # ---------------------------------------------------------
 class ChatQuery(BaseModel):
     query: str
@@ -231,10 +281,10 @@ def detect_query_intent(query: str) -> str:
     q = query.lower()
 
     intents = {
-        "count_flagged": ["how many flagged", "count suspicious", "total alerts", "number of risks", "how many high"],
+        "count_flagged": ["how many flagged", "count suspicious", "total alerts", "number of risks", "how many high", "critical alerts"],
         "recent_activity": ["show recent", "latest transactions", "what happened recently", "newest alerts", "recent audit"],
         "account_investigation": ["why is account flagged", "tell me about account", "explain alert", "check details", "reason for risk"],
-        "list_high_risk": ["which accounts are flagged", "list suspicious accounts", "who got flagged", "show all high risk"]
+        "list_high_risk": ["which accounts are flagged", "list suspicious accounts", "who got flagged", "show all high risk", "show critical"]
     }
 
     best_intent = "unknown"
@@ -253,7 +303,7 @@ def detect_query_intent(query: str) -> str:
 def compliance_assistant_chat(req: ChatQuery):
     raw_query = req.query.strip()
 
-    with sqlite3.connect(DB_FILE) as conn:
+    with sqlite3.connect(DB_FILE, timeout=5.0) as conn:
         cursor = conn.cursor()
         target_account = extract_account_id(raw_query, cursor)
         intent = detect_query_intent(raw_query)
@@ -288,20 +338,20 @@ def compliance_assistant_chat(req: ChatQuery):
                 }
 
         if intent == "count_flagged":
-            cursor.execute("SELECT COUNT(*) FROM screening_audit WHERE risk_level = 'HIGH'")
+            cursor.execute("SELECT COUNT(*) FROM screening_audit WHERE risk_level IN ('HIGH', 'CRITICAL')")
             high_count = cursor.fetchone()[0]
             cursor.execute("SELECT COUNT(*) FROM screening_audit")
             total = cursor.fetchone()[0]
             return {
-                "response": f"Currently, there are {high_count} HIGH-risk flagged accounts out of {total} total screened accounts."
+                "response": f"Currently, there are {high_count} HIGH/CRITICAL-risk flagged accounts out of {total} total screened accounts."
             }
 
         if intent == "list_high_risk":
-            cursor.execute("SELECT DISTINCT subject_account, primary_typology FROM screening_audit WHERE risk_level = 'HIGH' LIMIT 10")
+            cursor.execute("SELECT DISTINCT subject_account, primary_typology, risk_level FROM screening_audit WHERE risk_level IN ('HIGH', 'CRITICAL') LIMIT 10")
             rows = cursor.fetchall()
             if not rows:
-                return {"response": "There are currently no accounts flagged as HIGH risk."}
-            items = [f"• {acc} ({typology})" for acc, typology in rows]
+                return {"response": "There are currently no accounts flagged as HIGH or CRITICAL risk."}
+            items = [f"• {acc} ({typology}) [{risk}]" for acc, typology, risk in rows]
             return {
                 "response": "The following accounts are currently flagged for review:\n" + "\n".join(items)
             }
