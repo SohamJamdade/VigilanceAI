@@ -32,15 +32,12 @@ from service.cases import (
 
 runtime_state: Dict[str, Any] = {}
 
-
 def safe_dump_dict(obj: Any) -> Dict[str, Any]:
-    # Pydantic v2/v1 safe dict conversion
     if hasattr(obj, "model_dump"):
         return obj.model_dump()
     if hasattr(obj, "dict"):
         return obj.dict()
     return dict(obj)
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -71,9 +68,7 @@ async def lifespan(app: FastAPI):
     yield
     runtime_state.clear()
 
-
 app = FastAPI(title="VigilanceAI Financial Risk Platform", version="2.0.0", lifespan=lifespan)
-
 
 def synthesize_slm_reasoning(
     account_id: str,
@@ -112,7 +107,6 @@ def synthesize_slm_reasoning(
         curr_ids = torch.tensor([input_ids], dtype=torch.long, device="cpu")
 
         with torch.no_grad():
-            # Capped at 48 tokens for fast completion without timeout
             for _ in range(48):
                 idx_window = curr_ids if curr_ids.size(1) <= model.max_seq_len else curr_ids[:, -model.max_seq_len:]
                 logits, _ = model(idx_window)
@@ -139,7 +133,6 @@ def synthesize_slm_reasoning(
         "supporting_evidence": [r.reason for r in rules if r.triggered] or ["All activities conform to baseline."]
     }
 
-
 def run_pipeline(
     account_id: str,
     incoming_txs: List[NormalizedTransaction],
@@ -148,7 +141,6 @@ def run_pipeline(
 ) -> RiskAssessment:
     case_id = f"CASE-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:6].upper()}"
 
-    # Resolve baseline from payload or compute from transaction amounts
     base_obj = raw_payload.get("account_baseline", {})
     if base_obj.get("historical_median"):
         dyn_median = float(base_obj["historical_median"])
@@ -169,7 +161,6 @@ def run_pipeline(
     rule_results = evaluate_rules(incoming_txs, features, statutory_limit)
     entity_prof = resolve_entity(account_id, incoming_txs, DB_FILE)
 
-    # Calculate deterministic risk score from rule severities
     critical_hits = sum(1 for r in rule_results if r.triggered and r.severity == "CRITICAL")
     high_hits = sum(1 for r in rule_results if r.triggered and r.severity == "HIGH")
     raw_score = (critical_hits * 0.7) + (high_hits * 0.3) + (min(features.baseline_deviation_ratio, 10.0) * 0.03)
@@ -177,7 +168,6 @@ def run_pipeline(
 
     slm_decision = synthesize_slm_reasoning(account_id, features, rule_results, entity_prof, incoming_txs)
 
-    # Regulatory override: critical or high rules dictate risk, action, and typology
     final_risk = slm_decision.get("risk_level", "LOW")
     final_typology = slm_decision.get("primary_typology", "NORMAL_ROUTINE")
     final_action = slm_decision.get("recommended_action", "AUTO_CLEAR")
@@ -227,9 +217,6 @@ def run_pipeline(
     record_case(assessment, raw_payload, DB_FILE)
     return assessment
 
-
-# --- API Endpoints ---
-
 @app.post("/v1/screen", status_code=status.HTTP_200_OK)
 async def screen_transaction(payload: Dict[str, Any]):
     account_id = str(payload.get("subject_account") or payload.get("account_baseline", {}).get("account_id", "UNKNOWN"))
@@ -267,7 +254,6 @@ async def screen_transaction(payload: Dict[str, Any]):
         }
     }
 
-
 class SingleTransactionEvent(BaseModel):
     account_id: str
     tx_id: str
@@ -276,7 +262,6 @@ class SingleTransactionEvent(BaseModel):
     recipient: str
     device_id: str = "DEV-MOBILE"
     statutory_limit: float = 50000.0
-
 
 @app.post("/v1/ingest", status_code=status.HTTP_200_OK)
 async def ingest_transaction(event: SingleTransactionEvent):
@@ -315,10 +300,8 @@ async def ingest_transaction(event: SingleTransactionEvent):
         }
     }
 
-
 class ChatQuery(BaseModel):
     query: str
-
 
 def _extract_account_target(query: str, cursor: sqlite3.Cursor) -> Optional[str]:
     cursor.execute("SELECT DISTINCT subject_account FROM screening_audit UNION SELECT DISTINCT account_id FROM risk_cases")
@@ -327,7 +310,6 @@ def _extract_account_target(query: str, cursor: sqlite3.Cursor) -> Optional[str]
         return None
 
     q_upper = query.upper()
-
     for acc in known_accounts:
         if acc.upper() in q_upper:
             return acc
@@ -347,7 +329,6 @@ def _extract_account_target(query: str, cursor: sqlite3.Cursor) -> Optional[str]
 
     return None
 
-
 @app.post("/v1/chat")
 def compliance_assistant_chat(req: ChatQuery):
     q = req.query.strip()
@@ -355,7 +336,6 @@ def compliance_assistant_chat(req: ChatQuery):
 
     with sqlite3.connect(DB_FILE, timeout=5.0) as conn:
         cursor = conn.cursor()
-
         target_account = _extract_account_target(q, cursor)
 
         if target_account:
@@ -391,15 +371,10 @@ def compliance_assistant_chat(req: ChatQuery):
 
                 if triggered:
                     for idx, r in enumerate(triggered, 1):
-                        rule_name = r.get("rule_name", "Unknown Rule")
-                        rule_id = r.get("rule_id", "N/A")
-                        sev = r.get("severity", "HIGH")
-                        rsn = r.get("reason", "Rule triggered.")
-                        ev = r.get("evidence", {})
-                        lines.append(f"{idx}. 🚨 **{rule_name}** (`{rule_id}` — {sev})")
-                        lines.append(f"   - **Rule Finding:** {rsn}")
-                        if ev:
-                            ev_details = ", ".join(f"{k}: `{v}`" for k, v in ev.items())
+                        lines.append(f"{idx}. 🚨 **{r.get('rule_name', 'Rule')}** (`{r.get('rule_id', 'N/A')}` — {r.get('severity', 'HIGH')})")
+                        lines.append(f"   - **Rule Finding:** {r.get('reason', 'Rule triggered.')}")
+                        if r.get("evidence"):
+                            ev_details = ", ".join(f"{k}: `{v}`" for k, v in r['evidence'].items())
                             lines.append(f"   - **Evidence:** {ev_details}")
                 else:
                     lines.append("• No deterministic compliance rules were triggered. Transactions conform to baseline thresholds.")
@@ -416,41 +391,13 @@ def compliance_assistant_chat(req: ChatQuery):
                     ])
 
                 entity_data = json.loads(entity_json) if entity_json else {}
-                if entity_data:
-                    shared = entity_data.get("shared_device_accounts", [])
-                    if shared:
-                        lines.append(f"- ⚠️ **Entity Linkage Alert:** Hardware device shared with other account(s): {', '.join(shared)}")
+                if entity_data and entity_data.get("shared_device_accounts"):
+                    lines.append(f"- ⚠️ **Entity Linkage Alert:** Hardware device shared with other account(s): {', '.join(entity_data['shared_device_accounts'])}")
 
                 if reasoning and reasoning.strip():
-                    lines.extend([
-                        "",
-                        f"#### 🧠 Contextual Synthesis:\n{reasoning}"
-                    ])
+                    lines.extend(["", f"#### 🧠 Contextual Synthesis:\n{reasoning}"])
 
                 return {"response": "\n".join(lines)}
-
-            cursor.execute("""
-                SELECT risk_level, primary_typology, recommended_action, evidence_summary, timestamp
-                FROM screening_audit WHERE UPPER(subject_account) = ? ORDER BY id DESC LIMIT 1
-            """, (target_account.upper(),))
-            audit_row = cursor.fetchone()
-            if audit_row:
-                risk, typ, act, ev_summary, ts = audit_row
-                try:
-                    ev_list = json.loads(ev_summary)
-                    ev_str = "; ".join(ev_list) if isinstance(ev_list, list) else str(ev_list)
-                except Exception:
-                    ev_str = str(ev_summary)
-                return {
-                    "response": (
-                        f"### Investigation Report: **{target_account}**\n"
-                        f"- **Risk Level:** {risk}\n"
-                        f"- **Typology:** {typ}\n"
-                        f"- **Recommended Action:** {act}\n"
-                        f"- **Last Screened:** {ts}\n"
-                        f"- **Evidence Summary:** {ev_str}"
-                    )
-                }
 
         if any(w in q_lower for w in ["which", "flagged", "who", "list", "show", "cases", "accounts", "alert", "high", "critical"]):
             cursor.execute("""
@@ -472,15 +419,10 @@ def compliance_assistant_chat(req: ChatQuery):
             flagged = cursor.fetchone()[0]
             cursor.execute("SELECT COUNT(*) FROM screening_audit")
             total = cursor.fetchone()[0]
-            return {
-                "response": f"VigilanceAI Metrics: {flagged} high/critical alerts recorded across {total} total screenings."
-            }
+            return {"response": f"VigilanceAI Metrics: {flagged} high/critical alerts recorded across {total} total screenings."}
 
         if any(w in q_lower for w in ["recent", "latest", "last", "new", "activity"]):
-            cursor.execute("""
-                SELECT subject_account, risk_level, primary_typology, timestamp
-                FROM screening_audit ORDER BY id DESC LIMIT 5
-            """)
+            cursor.execute("SELECT subject_account, risk_level, primary_typology, timestamp FROM screening_audit ORDER BY id DESC LIMIT 5")
             rows = cursor.fetchall()
             if rows:
                 items = [f"• {r[0]} [{r[1]}] {r[2]} ({r[3]})" for r in rows]
@@ -499,12 +441,8 @@ def compliance_assistant_chat(req: ChatQuery):
             )
         }
 
-
-# --- REST Case & Telemetry Endpoints for Remote/Container Dashboard Access ---
-
 @app.get("/v1/cases")
 def list_cases(limit: int = 50):
-    # Returns structured case dossiers directly from SQLite
     with sqlite3.connect(DB_FILE, timeout=5.0) as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
@@ -514,30 +452,22 @@ def list_cases(limit: int = 50):
                    features_json, triggered_rules_json
             FROM risk_cases ORDER BY created_at DESC LIMIT ?
         """, (limit,))
-        rows = cursor.fetchall()
-        return {"cases": [dict(r) for r in rows]}
-
+        return {"cases": [dict(r) for r in cursor.fetchall()]}
 
 @app.get("/v1/telemetry")
 def get_telemetry():
-    # Returns portfolio risk metrics directly from SQLite
     with sqlite3.connect(DB_FILE, timeout=5.0) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT risk_level, COUNT(*) as count FROM screening_audit GROUP BY risk_level")
-        rows = cursor.fetchall()
-        return {"counts": [{"risk_level": r[0], "count": r[1]} for r in rows]}
-
+        return {"counts": [{"risk_level": r[0], "count": r[1]} for r in cursor.fetchall()]}
 
 @app.get("/v1/batches")
 def list_batches():
     return {"batches": get_upload_history(DB_FILE)}
 
-
 @app.delete("/v1/batches/{batch_id}")
 def remove_batch(batch_id: str):
-    result = delete_upload_batch(batch_id, DB_FILE)
-    return result
-
+    return delete_upload_batch(batch_id, DB_FILE)
 
 @app.delete("/v1/records/all")
 def clear_all_data():

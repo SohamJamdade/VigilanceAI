@@ -3,15 +3,16 @@ import json
 import time
 import sqlite3
 import threading
+import pandas as pd
 import requests
+import uuid
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 API_BASE = os.getenv("VIGILANCE_API_URL", "http://localhost:8000")
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
 DEFAULT_CONFIG = "db_credentials.json"
 
-# Shared poller telemetry dict consumed by dashboard
 poller_telemetry: Dict[str, Any] = {
     "status": "IDLE",
     "last_scan": None,
@@ -21,6 +22,133 @@ poller_telemetry: Dict[str, Any] = {
     "db_path": None,
     "table": "transactions",
 }
+
+
+def run_single_scan(db_path: str = "core_banking.db", table: str = "transactions") -> int:
+    resolved_path = os.path.abspath(db_path)
+    if not os.path.exists(resolved_path):
+        poller_telemetry["last_error"] = f"Database not found at {resolved_path}"
+        return 0
+
+    api_url = os.getenv("VIGILANCE_API_URL", API_BASE)
+    scanned_count = 0
+
+    try:
+        with sqlite3.connect(resolved_path, timeout=10.0) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+
+            table_check = cursor.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name=?;", (table,)
+            ).fetchone()
+            if not table_check:
+                poller_telemetry["last_error"] = f"Table '{table}' does not exist in {resolved_path}"
+                return 0
+
+            # Ensure screening_status column exists in user database table
+            col_info = cursor.execute(f"PRAGMA table_info('{table}')").fetchall()
+            col_names = [c[1] for c in col_info]
+            if "screening_status" not in col_names:
+                cursor.execute(f"ALTER TABLE '{table}' ADD COLUMN screening_status TEXT DEFAULT 'PENDING'")
+                conn.commit()
+
+            # Fetch pending records
+            cursor.execute(f"""
+                SELECT * FROM '{table}' 
+                WHERE screening_status = 'PENDING' OR screening_status IS NULL 
+                LIMIT 100
+            """)
+            rows = cursor.fetchall()
+            if not rows:
+                poller_telemetry["last_scan"] = datetime.now().strftime("%H:%M:%S")
+                poller_telemetry["status"] = "IDLE (0 pending records)"
+                poller_telemetry["last_error"] = None
+                return 0
+
+            grouped: Dict[str, List[Dict[str, Any]]] = {}
+            for r in rows:
+                d = dict(r)
+                acc = str(d.get("account_id") or d.get("account") or d.get("user_id") or "ACC-UNKNOWN")
+                grouped.setdefault(acc, []).append(d)
+
+            for acc, tx_list in grouped.items():
+                amounts = [float(t.get("amount") or 0.0) for t in tx_list]
+                dyn_median = float(pd.Series(amounts).median()) if amounts else 0.0
+
+                batch_records = []
+                for t in tx_list:
+                    raw_id = t.get("tx_id") or t.get("id") or f"TXN-{uuid.uuid4().hex[:6]}"
+                    batch_records.append({
+                        "tx_id": str(raw_id),
+                        "amount": float(t.get("amount") or 0.0),
+                        "rail": str(t.get("rail") or "IMPS"),
+                        "recipient": str(t.get("recipient") or "UNKNOWN"),
+                        "device_id": str(t.get("device_id") or t.get("device") or "DEV-UNKNOWN"),
+                        "location": str(t.get("location") or "DOMESTIC")
+                    })
+
+                payload = {
+                    "subject_account": acc,
+                    "batch_records": batch_records,
+                    "account_baseline": {
+                        "account_id": acc,
+                        "historical_median": dyn_median,
+                        "typical_bracket": [min(amounts), max(amounts)] if amounts else [0.0, 0.0]
+                    }
+                }
+
+                # Dispatch via HTTP or fallback to local pipeline execution
+                success = False
+                try:
+                    resp = requests.post(f"{api_url}/v1/screen", json=payload, timeout=15)
+                    if resp.status_code == 200:
+                        success = True
+                except Exception:
+                    pass
+
+                if not success:
+                    try:
+                        from service.app import run_pipeline, NormalizedTransaction
+                        norm_txs = [
+                            NormalizedTransaction(
+                                tx_id=r["tx_id"],
+                                account_id=acc,
+                                amount=r["amount"],
+                                currency="INR",
+                                rail=r["rail"].upper(),
+                                recipient=r["recipient"],
+                                device_id=r["device_id"],
+                                timestamp=datetime.now(timezone.utc),
+                                location=r["location"],
+                                source_hash="DB_SCAN_LOCAL"
+                            ) for r in batch_records
+                        ]
+                        run_pipeline(acc, norm_txs, payload)
+                        success = True
+                    except Exception as pipe_err:
+                        poller_telemetry["last_error"] = f"Pipeline error: {pipe_err}"
+
+                if success:
+                    for t in tx_list:
+                        row_id = t.get("id")
+                        tx_id_val = t.get("tx_id")
+                        if row_id is not None:
+                            cursor.execute(f"UPDATE '{table}' SET screening_status = 'SCREENED' WHERE id = ?", (row_id,))
+                        elif tx_id_val is not None:
+                            cursor.execute(f"UPDATE '{table}' SET screening_status = 'SCREENED' WHERE tx_id = ?", (tx_id_val,))
+                    scanned_count += len(tx_list)
+
+            conn.commit()
+
+        poller_telemetry["total_scanned"] += scanned_count
+        poller_telemetry["last_scan"] = datetime.now().strftime("%H:%M:%S")
+        poller_telemetry["status"] = "IDLE (Last Scan Successful)"
+        poller_telemetry["last_error"] = None
+        return scanned_count
+
+    except Exception as e:
+        poller_telemetry["last_error"] = str(e)
+        return 0
 
 
 class AutomatedDBPoller:
@@ -53,76 +181,7 @@ class AutomatedDBPoller:
 
     def run_single_scan(self) -> int:
         poller_telemetry["status"] = "SCANNING"
-        poller_telemetry["last_scan"] = datetime.now(timezone.utc).isoformat()
-        scanned_count = 0
-
-        try:
-            conn = sqlite3.connect(self.db_path, timeout=10.0)
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-
-            # Select pending transactions from the specified table
-            cursor.execute(
-                f"SELECT id, tx_id, account_id, amount, rail, recipient, device_id, created_at "
-                f"FROM {self.table} WHERE screening_status = 'PENDING' ORDER BY id ASC LIMIT 100"
-            )
-            rows = cursor.fetchall()
-
-            if not rows:
-                poller_telemetry["last_error"] = None
-                conn.close()
-                return 0
-
-            # Group transactions by account ID for batch evaluation
-            grouped = {}
-            for row in rows:
-                acc = row["account_id"]
-                grouped.setdefault(acc, []).append(dict(row))
-
-            for acc_id, txs in grouped.items():
-                payload = {
-                    "subject_account": acc_id,
-                    "batch_records": [
-                        {
-                            "tx_id": t["tx_id"],
-                            "amount": float(t["amount"]),
-                            "rail": t.get("rail", "IMPS"),
-                            "recipient": t.get("recipient", "UNKNOWN"),
-                            "device": t.get("device_id", "DEV-UNKNOWN"),
-                            "time": t.get("created_at"),
-                        }
-                        for t in txs
-                    ],
-                }
-
-                try:
-                    resp = requests.post(f"{self.api_base}/v1/screen", json=payload, timeout=120)
-                    if resp.status_code == 200:
-                        tx_ids = [t["id"] for t in txs]
-                        placeholders = ",".join("?" for _ in tx_ids)
-                        cursor.execute(
-                            f"UPDATE {self.table} SET screening_status = 'SCREENED' WHERE id IN ({placeholders})",
-                            tx_ids,
-                        )
-                        conn.commit()
-                        scanned_count += len(txs)
-                        poller_telemetry["total_scanned"] += len(txs)
-                        poller_telemetry["last_error"] = None
-                    else:
-                        poller_telemetry["last_error"] = f"HTTP {resp.status_code} on {acc_id}"
-                except requests.exceptions.ConnectionError:
-                    poller_telemetry["last_error"] = f"Backend unreachable at {self.api_base}"
-                except Exception as e:
-                    poller_telemetry["last_error"] = str(e)
-
-            conn.close()
-            return scanned_count
-
-        except Exception as e:
-            poller_telemetry["last_error"] = str(e)
-            return 0
-        finally:
-            poller_telemetry["status"] = "IDLE"
+        return run_single_scan(self.db_path, self.table)
 
     def _loop(self):
         while not self._stop_event.is_set():
@@ -156,11 +215,6 @@ def get_poller(db_path: Optional[str] = None, table: Optional[str] = None) -> Au
     if _global_poller is None or db_path or table:
         _global_poller = AutomatedDBPoller(db_path=db_path, table=table)
     return _global_poller
-
-
-def run_single_scan(db_path: Optional[str] = None, table: Optional[str] = None) -> int:
-    poller = get_poller(db_path=db_path, table=table)
-    return poller.run_single_scan()
 
 
 def start_poller(db_path: Optional[str] = None, table: Optional[str] = None) -> bool:
