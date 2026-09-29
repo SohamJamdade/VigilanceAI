@@ -44,7 +44,7 @@ class CausalSelfAttention(nn.Module):
         return self.out_proj(out)
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model: int = 384, n_heads: int = 12, max_seq_len: int = 512):
+    def __init__(self, d_model: int = 768, n_heads: int = 16, max_seq_len: int = 512):
         super().__init__()
         self.attn_norm = RMSNorm(d_model)
         self.attn = CausalSelfAttention(d_model, n_heads, max_seq_len)
@@ -61,7 +61,7 @@ class TransformerBlock(nn.Module):
         return x
 
 class FinancialSLM(nn.Module):
-    def __init__(self, vocab_size: int = 2048, d_model: int = 384, n_layers: int = 8, n_heads: int = 12, max_seq_len: int = 512):
+    def __init__(self, vocab_size: int = 2048, d_model: int = 768, n_layers: int = 16, n_heads: int = 12, max_seq_len: int = 512):
         super().__init__()
         self.max_seq_len = max_seq_len
         self.tok_embeddings = nn.Embedding(vocab_size, d_model)
