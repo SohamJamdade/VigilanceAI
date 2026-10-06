@@ -221,14 +221,47 @@ def _norm_ident(value: Any) -> str:
     return re.sub(r'\s+', '', str(value or '')).upper()
 
 
-def _rules_fallback(features: FeatureSet, rules: List[RuleResult]) -> Dict[str, Any]:
+def _rules_fallback(
+    features: FeatureSet,
+    rules: List[RuleResult],
+    transactions: Optional[List[NormalizedTransaction]] = None,
+    account_id: str = "ACCOUNT"
+) -> Dict[str, Any]:
     triggered = [r for r in rules if r.triggered]
     high_rule = any(r.severity in ("HIGH", "CRITICAL") for r in triggered)
+    rec_action = "BLOCK_IMMEDIATELY" if any(r.severity == "CRITICAL" for r in triggered) else ("ESCALATE_TO_FIU" if high_rule else "AUTO_CLEAR")
+
+    sentences = [
+        f"Subject account {account_id} executed {features.window_tx_count} transaction(s) totaling INR {features.window_total_amount:,.2f} at a velocity of {features.velocity_tx_per_hour:.1f} tx/hr."
+    ]
+    if triggered:
+        sentences.append(" ".join(r.reason for r in triggered))
+    else:
+        sentences.append("All observed transaction activity conforms to normal historical baseline parameters and regulatory limits.")
+    sentences.append(f"Recommended compliance action is {rec_action} based on observed risk indicators.")
+    narrative_text = " ".join(sentences)
+
+    evidence_list = []
+    for r in triggered:
+        evidence_list.append(r.reason)
+        flagged = r.evidence.get("flagged_transactions", [])
+        if isinstance(flagged, list):
+            for t_line in flagged:
+                if t_line not in evidence_list:
+                    evidence_list.append(t_line)
+
+    if not evidence_list:
+        evidence_list = [f"All {features.window_tx_count} transactions conform to baseline."]
+        if transactions:
+            for t in transactions[:3]:
+                evidence_list.append(f"Tx {t.tx_id}: INR {t.amount:,.2f} via {t.rail} to '{t.recipient}'")
+
     return {
-        "risk_level": "HIGH" if high_rule else "LOW",
-        "primary_typology": "STRUCTURING_SMURFING" if features.near_threshold_count >= 2 else "NORMAL_ROUTINE",
-        "recommended_action": "ESCALATE_TO_FIU" if high_rule else "AUTO_CLEAR",
-        "supporting_evidence": [r.reason for r in triggered] or ["All activities conform to baseline."],
+        "risk_level": "CRITICAL" if any(r.severity == "CRITICAL" for r in triggered) else ("HIGH" if high_rule else "LOW"),
+        "primary_typology": "SANCTIONS_BREACH" if any(r.rule_id == "RULE_SANCT_003" for r in triggered) else ("STRUCTURING_SMURFING" if features.near_threshold_count >= 2 else "NORMAL_ROUTINE"),
+        "recommended_action": rec_action,
+        "narrative": narrative_text,
+        "supporting_evidence": evidence_list,
     }
 
 
@@ -270,9 +303,15 @@ def _parse_slm_output(raw_text: str) -> Optional[Dict[str, Any]]:
     return salvaged or None
 
 
-def _sanitize_decision(raw: Optional[Dict[str, Any]], features: FeatureSet, rules: List[RuleResult]) -> Dict[str, Any]:
+def _sanitize_decision(
+    raw: Optional[Dict[str, Any]],
+    features: FeatureSet,
+    rules: List[RuleResult],
+    transactions: Optional[List[NormalizedTransaction]] = None,
+    account_id: str = "ACCOUNT"
+) -> Dict[str, Any]:
     """Never trust raw model output: validate values and keep them consistent with the rules."""
-    fallback = _rules_fallback(features, rules)
+    fallback = _rules_fallback(features, rules, transactions, account_id)
     if not raw:
         return fallback
 
@@ -294,6 +333,12 @@ def _sanitize_decision(raw: Optional[Dict[str, Any]], features: FeatureSet, rule
     if not re.fullmatch(r"[A-Z0-9_]{3,60}", typology):
         typology = fallback["primary_typology"]
 
+    narrative = raw.get("narrative") or raw.get("slm_reasoning")
+    if not narrative or not isinstance(narrative, str) or len(narrative.strip()) < 10:
+        narrative = fallback["narrative"]
+    else:
+        narrative = clean_narrative_text(narrative)
+
     evidence = raw.get("supporting_evidence")
     if isinstance(evidence, str):
         evidence = [evidence]
@@ -305,6 +350,7 @@ def _sanitize_decision(raw: Optional[Dict[str, Any]], features: FeatureSet, rule
         "risk_level": risk,
         "primary_typology": typology,
         "recommended_action": action,
+        "narrative": narrative,
         "supporting_evidence": evidence,
     }
 
@@ -324,7 +370,7 @@ def synthesize_slm_reasoning(
         target_end_id = engine.get("target_end_id")
 
         if model is None or tokenizer is None:
-            return _rules_fallback(features, rules)
+            return _rules_fallback(features, rules, latest_txs, account_id)
 
         base_ctx = {
             "account_id": account_id,
@@ -337,6 +383,7 @@ def synthesize_slm_reasoning(
                 "deviation_ratio": features.baseline_deviation_ratio
             },
             "triggered_rules": [r.rule_id for r in rules if r.triggered],
+            "rule_reasons": [r.reason for r in rules if r.triggered],
             "shared_devices": len(entity.shared_device_accounts),
         }
         input_ids = _build_prompt_ids(base_ctx, latest_txs, tokenizer)
@@ -362,7 +409,7 @@ def synthesize_slm_reasoning(
     except Exception as e:
         print(f"[WARN] SLM generation error ({e}); using rules fallback.")
 
-    return _sanitize_decision(raw_decision, features, rules)
+    return _sanitize_decision(raw_decision, features, rules, latest_txs, account_id)
 
 
 
@@ -492,8 +539,8 @@ def run_pipeline(
             else:
                 final_typology = "SUSPICIOUS_ACTIVITY"
 
-    evidence = slm_decision["supporting_evidence"]
-    slm_reasoning_str = "; ".join(evidence)
+    evidence = slm_decision.get("supporting_evidence", [])
+    slm_reasoning_str = slm_decision.get("narrative") or "; ".join(evidence)
 
     repro_hash = _reproducibility_hash(
         account_id, incoming_txs, rule_results, deterministic_score, final_risk, statutory_limit
@@ -548,7 +595,18 @@ def screen_account_hybrid(account_id: str, transactions: List[Dict[str, Any]]) -
         ]
     }
     assessment = run_pipeline(account_id, norm_txs, raw_payload)
-    evidence = [r.reason for r in assessment.triggered_rules if r.triggered]
+    evidence = []
+    for r in assessment.triggered_rules:
+        if r.triggered:
+            evidence.append(r.reason)
+            tx_lines = r.evidence.get("flagged_transactions", []) if isinstance(r.evidence, dict) else []
+            if isinstance(tx_lines, list):
+                for line in tx_lines:
+                    if line not in evidence:
+                        evidence.append(line)
+    if not evidence:
+        evidence = ["All activities conform to baseline."]
+
     return {
         "account_id": account_id,
         "risk_level": assessment.confidence_level,

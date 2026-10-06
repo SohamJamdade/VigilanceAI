@@ -132,7 +132,18 @@ def query_compliance_assistant(query_text: str) -> str:
                     try:
                         ev_list = json.loads(row["evidence"]) if isinstance(row["evidence"], str) else row["evidence"]
                         if isinstance(ev_list, list):
-                            ev_str = "\n" + "\n".join([f"- {e}" for e in ev_list])
+                            formatted_bullets = []
+                            for e in ev_list:
+                                if isinstance(e, dict):
+                                    r_name = e.get("rule_name", e.get("rule_id", "Indicator"))
+                                    r_reason = e.get("reason", "")
+                                    r_ev = e.get("evidence", {})
+                                    txs = r_ev.get("flagged_transactions", []) if isinstance(r_ev, dict) else []
+                                    tx_str = ("\n  " + "\n  ".join([f"• {t}" for t in txs])) if txs else ""
+                                    formatted_bullets.append(f"- **{r_name}**: {r_reason}{tx_str}")
+                                else:
+                                    formatted_bullets.append(f"- {e}")
+                            ev_str = "\n" + "\n".join(formatted_bullets)
                         elif isinstance(ev_list, dict):
                             ev_str = "\n" + "\n".join([f"- **{k}**: {v}" for k, v in ev_list.items()])
                         else:
@@ -511,21 +522,46 @@ with tab_cases:
                 c2.write(f"**Primary Typology:** `{row['primary_typology']}`")
                 c3.write(f"**Recommended Action:** `{row['recommended_action']}`")
 
-                st.markdown("**SLM Contextual Reasoning & Narrative:**")
-                st.write(row.get('model_reasoning') or "Evaluation complete.")
+                st.markdown("**🧠 SLM Contextual Reasoning & Narrative:**")
+                st.info(row.get('model_reasoning') or "Evaluation complete.")
 
                 raw_rules = row.get('triggered_rules_json')
                 if raw_rules:
-                    st.markdown("**Evidence & Indicators:**")
+                    st.markdown("**📋 Triggered Evidence & Indicators:**")
                     try:
                         rules_data = json.loads(raw_rules) if isinstance(raw_rules, str) else raw_rules
                         if isinstance(rules_data, list):
                             for r in rules_data:
-                                st.warning(f"⚠️ {r}")
+                                if isinstance(r, dict):
+                                    if r.get("triggered", True):
+                                        r_name = r.get("rule_name", r.get("rule_id", "Rule Finding"))
+                                        r_reason = r.get("reason", "Rule triggered.")
+                                        st.warning(f"⚠️ **{r_name}**: {r_reason}")
+                                        r_ev = r.get("evidence", {})
+                                        flagged_txs = r_ev.get("flagged_transactions", []) if isinstance(r_ev, dict) else []
+                                        if flagged_txs:
+                                            for tx_line in flagged_txs:
+                                                st.caption(f"  └─ {tx_line}")
+                                else:
+                                    st.warning(f"⚠️ {r}")
                         else:
                             st.write(rules_data)
                     except Exception:
                         st.write(raw_rules)
+
+                raw_features = row.get('features_json')
+                if raw_features:
+                    try:
+                        feat = json.loads(raw_features) if isinstance(raw_features, str) else raw_features
+                        if isinstance(feat, dict):
+                            st.markdown("**📊 Associated Feature Metrics:**")
+                            f1, f2, f3, f4 = st.columns(4)
+                            f1.metric("Tx Count", feat.get("window_tx_count", 0))
+                            f2.metric("Total Volume", f"₹{float(feat.get('window_total_amount', 0)):,.2f}")
+                            f3.metric("Velocity", f"{float(feat.get('velocity_tx_per_hour', 0)):.1f} tx/hr")
+                            f4.metric("Near-Threshold Count", feat.get("near_threshold_count", 0))
+                    except Exception:
+                        pass
     else:
         st.info("No cases currently recorded. Upload a CSV file or start the database poller.")
 
