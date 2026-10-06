@@ -7,3 +7,6 @@ venv/
 db_credentials.json
 
 checkpoints/*.pt
+
+*.db-shm
+*.db-wal
