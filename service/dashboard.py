@@ -20,6 +20,7 @@ from service.cases import (
     log_upload_batch, get_upload_history, delete_upload_batch,
     purge_all_records, DB_FILE, init_case_storage
 )
+from service.db_utils import get_db_connection
 
 API_BASE = os.getenv("VIGILANCE_API_URL", "http://localhost:8000")
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -48,9 +49,12 @@ def fast_purge_cases():
 
     if os.path.exists(AUDIT_DB_PATH):
         try:
-            with sqlite3.connect(AUDIT_DB_PATH) as conn:
+            conn = get_db_connection(AUDIT_DB_PATH)
+            try:
                 conn.cursor().execute("DELETE FROM alerts")
                 conn.commit()
+            finally:
+                conn.close()
             purged = True
         except Exception:
             pass
@@ -84,8 +88,8 @@ def query_compliance_assistant(query_text: str) -> str:
             target_account = f"ACC-{digits_match.group(1)}"
 
 
-    with sqlite3.connect(AUDIT_DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
+    conn = get_db_connection(AUDIT_DB_PATH)
+    try:
         cur = conn.cursor()
 
         def table_exists(tbl_name: str) -> bool:
@@ -210,6 +214,8 @@ Ask for **'accounts flagged'** or **'Why is account <id> flagged?'** for case sp
             return f"I can review flagged accounts and risk dossiers. Recent accounts in audit log: {recs}.\n\nTry asking:\n- *'Why is account ACC-40005 flagged?'*\n- *'Why is ACC-DROP-99 flagged?'*\n- *'Show flagged accounts'*\n- *'Risk overview'*"
         else:
             return "All screened accounts currently conform to baseline. No high-risk alerts."
+    finally:
+        conn.close()
 
 THEME_CSS = """
 <style>
@@ -353,7 +359,7 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("### ⚙️ Quick Maintenance")
-    if st.button("🧹 Clear All Cases", use_container_width=True):
+    if st.button("🧹 Clear All Cases", width="stretch"):
         if fast_purge_cases():
             st.toast("✅ All cases and audit logs wiped clean!", icon="🧹")
             time.sleep(0.5)
@@ -448,7 +454,7 @@ with tab_upload:
                     st.write(f"**{batch['tx_count']}** transactions | **{batch['account_count']}** account(s)")
                     st.caption(f"Accounts: `{acc_preview}`")
                 with col_btn:
-                    if st.button("🗑️ Delete", key=f"del_{batch['batch_id']}", use_container_width=True):
+                    if st.button("🗑️ Delete", key=f"del_{batch['batch_id']}", width="stretch"):
                         res = delete_upload_batch(batch["batch_id"], DB_FILE)
                         st.success(f"Deleted records for `{batch['filename']}`.")
                         st.cache_data.clear()
@@ -460,7 +466,7 @@ with tab_cases:
     with col_hdr:
         st.header("Investigative Cases")
     with col_purge:
-        if st.button("🗑️ Wipe Cases", use_container_width=True):
+        if st.button("🗑️ Wipe Cases", width="stretch"):
             if fast_purge_cases():
                 st.toast("Cases wiped successfully!", icon="🧹")
                 time.sleep(0.5)
@@ -470,8 +476,8 @@ with tab_cases:
     # 1. First check audit_log.db
     if os.path.exists(AUDIT_DB_PATH):
         try:
-            with sqlite3.connect(AUDIT_DB_PATH, timeout=5.0) as conn:
-                conn.row_factory = sqlite3.Row
+            conn = get_db_connection(AUDIT_DB_PATH)
+            try:
                 cur = conn.cursor()
                 cur.execute("""
                     SELECT id as case_id, timestamp as created_at, account_id, risk_level, 
@@ -481,6 +487,8 @@ with tab_cases:
                     FROM alerts ORDER BY id DESC LIMIT 50
                 """)
                 cases_list = [dict(row) for row in cur.fetchall()]
+            finally:
+                conn.close()
         except Exception:
             pass
 
@@ -495,8 +503,8 @@ with tab_cases:
 
     if not cases_list and os.path.exists(DB_FILE):
         try:
-            with sqlite3.connect(DB_FILE, timeout=5.0) as conn:
-                conn.row_factory = sqlite3.Row
+            conn = get_db_connection(DB_FILE)
+            try:
                 cursor = conn.cursor()
                 cursor.execute("""
                     SELECT case_id, created_at, account_id, risk_level, deterministic_score,
@@ -505,6 +513,8 @@ with tab_cases:
                     FROM risk_cases ORDER BY created_at DESC LIMIT 50
                 """)
                 cases_list = [dict(row) for row in cursor.fetchall()]
+            finally:
+                conn.close()
         except Exception:
             pass
 
@@ -596,9 +606,12 @@ with tab_metrics:
     # Priority 1: Read directly from audit_log.db
     if os.path.exists(AUDIT_DB_PATH):
         try:
-            with sqlite3.connect(AUDIT_DB_PATH, timeout=5.0) as conn:
+            conn = get_db_connection(AUDIT_DB_PATH)
+            try:
                 df_counts = pd.read_sql("SELECT risk_level, COUNT(*) as count FROM alerts GROUP BY risk_level", conn)
                 counts_data = df_counts.to_dict(orient="records")
+            finally:
+                conn.close()
         except Exception:
             pass
 
@@ -613,9 +626,12 @@ with tab_metrics:
 
     if not counts_data and os.path.exists(DB_FILE):
         try:
-            with sqlite3.connect(DB_FILE, timeout=5.0) as conn:
+            conn = get_db_connection(DB_FILE)
+            try:
                 df_counts = pd.read_sql("SELECT risk_level, COUNT(*) as count FROM screening_audit GROUP BY risk_level", conn)
                 counts_data = df_counts.to_dict(orient="records")
+            finally:
+                conn.close()
         except Exception:
             pass
 
@@ -642,7 +658,7 @@ with tab_metrics:
             margin=dict(t=70, b=30, l=30, r=30),
             transition=dict(duration=600, easing="cubic-in-out"),
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
     else:
         st.info("No screening data yet. Process a batch to see the distribution.")
 
@@ -679,14 +695,14 @@ with tab_poller:
 
     col_start, col_scan, col_stop = st.columns(3)
     with col_start:
-        if st.button("▶️ Start 60s Poller", type="primary", disabled=is_running(), use_container_width=True):
+        if st.button("▶️ Start 60s Poller", type="primary", disabled=is_running(), width="stretch"):
             if not target_db or not os.path.exists(target_db):
                 st.error(f"Database file not found: `{target_db}`")
             else:
                 start_poller(target_db, table=target_table)
                 st.rerun()
     with col_scan:
-            if st.button("⚡ Run Single Scan Now", use_container_width=True):
+            if st.button("⚡ Run Single Scan Now", width="stretch"):
                 resolved_db = os.path.abspath(target_db.strip()) if target_db else ""
                 if not resolved_db or not os.path.exists(resolved_db):
                     st.error(f"Database `{target_db}` not found on disk.")
@@ -706,7 +722,7 @@ with tab_poller:
                             st.info(f"0 pending transactions found in `{resolved_db}`:`{target_table}`. All records are already SCREENED or the table is empty.")
 
     with col_stop:
-        if st.button("⏹️️ Stop Poller", disabled=not is_running(), use_container_width=True):
+        if st.button("⏹️️ Stop Poller", disabled=not is_running(), width="stretch"):
             stop_poller()
             st.rerun()
 

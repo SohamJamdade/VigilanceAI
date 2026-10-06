@@ -16,6 +16,8 @@ BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if BASE_DIR not in sys.path:
     sys.path.append(BASE_DIR)
 
+from service.db_utils import get_db_connection
+
 WATCH_DIR = os.path.join(BASE_DIR, "data", "drop")
 PROCESSED_DIR = os.path.join(BASE_DIR, "data", "processed")
 DB_PATH = os.path.join(BASE_DIR, "core_banking.db")
@@ -68,47 +70,60 @@ class TransactionBatchHandler(FileSystemEventHandler):
             print(f"[!] Ingestion error on {file_path}: {e}")
 
     def process_file(self, file_path):
-        if file_path.endswith('.csv'):
-            df = pd.read_csv(file_path)
-        else:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            df = pd.DataFrame(data if isinstance(data, list) else data.get("transactions", []))
+        df = None
+        last_err = None
+        for attempt in range(3):
+            try:
+                if file_path.endswith('.csv'):
+                    df = pd.read_csv(file_path)
+                else:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                    df = pd.DataFrame(data if isinstance(data, list) else data.get("transactions", []))
+                break
+            except (PermissionError, OSError) as e:
+                last_err = e
+                time.sleep(0.5)
+
+        if df is None:
+            raise PermissionError(f"Could not read {file_path} after 3 attempts: {last_err}")
 
         if not REQUIRED_COLUMNS.issubset(set(df.columns)):
             missing = REQUIRED_COLUMNS - set(df.columns)
             raise ValueError(f"Batch file is missing required columns: {missing}")
 
-        conn = sqlite3.connect(DB_PATH)
-        cursor = conn.cursor()
+        conn = get_db_connection(DB_PATH)
+        try:
+            cursor = conn.cursor()
 
-        # Handle created_at vs timestamp column dynamically
-        time_col = 'timestamp' if 'timestamp' in df.columns else ('created_at' if 'created_at' in df.columns else None)
+            # Handle created_at vs timestamp column dynamically
+            time_col = 'timestamp' if 'timestamp' in df.columns else ('created_at' if 'created_at' in df.columns else None)
 
-        inserted_count = 0
-        for _, row in df.iterrows():
-            ts_val = str(row[time_col]) if time_col else time.strftime('%Y-%m-%dT%H:%M:%SZ')
-            cursor.execute("""
-                INSERT OR IGNORE INTO transactions 
-                (account_id, tx_id, amount, rail, recipient, device_id, location, created_at, screening_status, currency)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                str(row['account_id']),
-                str(row['tx_id']),
-                float(row['amount']),
-                str(row.get('rail', 'UPI')),
-                str(row.get('recipient', 'UNKNOWN')),
-                str(row.get('device_id', 'DEV-DEFAULT')),
-                str(row.get('location', 'DOMESTIC')),
-                ts_val,
-                'PENDING',
-                str(row.get('currency', 'INR'))
-            ))
-            if cursor.rowcount > 0:
-                inserted_count += 1
+            inserted_count = 0
+            for _, row in df.iterrows():
+                ts_val = str(row[time_col]) if time_col else time.strftime('%Y-%m-%dT%H:%M:%SZ')
+                cursor.execute("""
+                    INSERT OR IGNORE INTO transactions 
+                    (account_id, tx_id, amount, rail, recipient, device_id, location, created_at, screening_status, currency)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    str(row['account_id']),
+                    str(row['tx_id']),
+                    float(row['amount']),
+                    str(row.get('rail', 'UPI')),
+                    str(row.get('recipient', 'UNKNOWN')),
+                    str(row.get('device_id', 'DEV-DEFAULT')),
+                    str(row.get('location', 'DOMESTIC')),
+                    ts_val,
+                    'PENDING',
+                    str(row.get('currency', 'INR'))
+                ))
+                if cursor.rowcount > 0:
+                    inserted_count += 1
 
-        conn.commit()
-        conn.close()
+            conn.commit()
+        finally:
+            conn.close()
         print(f"[+] Ingested {inserted_count} new transactions into {DB_PATH}")
 
 

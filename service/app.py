@@ -21,6 +21,7 @@ from tokenizers import Tokenizer
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(PROJECT_ROOT)
 from model.transformer import FinancialSLM
+from service.db_utils import get_db_connection
 from service.schema import (
     NormalizedTransaction, BehavioralBaseline, FeatureSet,
     RuleResult, EntityProfile, RiskAssessment
@@ -37,7 +38,8 @@ from service.cases import (
 # Configuration
 # ─────────────────────────────────────────────────────────────
 TOKENIZER_PATH = os.getenv("VIGILANCE_TOKENIZER", os.path.join(PROJECT_ROOT, "tokenizer", "financial_bpe.json"))
-MAX_NEW_TOKENS = int(os.getenv("VIGILANCE_MAX_NEW_TOKENS", "96"))
+_raw_max_tokens = int(os.getenv("VIGILANCE_MAX_NEW_TOKENS", "56"))
+MAX_NEW_TOKENS = max(48, min(64, _raw_max_tokens))
 # Wall-clock cap per generation so one slow account can't hit the dashboard's 120s request timeout.
 SLM_TIMEOUT_S = float(os.getenv("VIGILANCE_SLM_TIMEOUT_S", "60"))
 
@@ -60,7 +62,8 @@ RISK_LEVELS = ("LOW", "MEDIUM", "HIGH", "CRITICAL")
 ALLOWED_ACTIONS = {"AUTO_CLEAR", "MONITOR", "MANUAL_REVIEW", "ESCALATE_TO_L2", "ESCALATE_TO_FIU", "BLOCK_IMMEDIATELY"}
 ESCALATING_ACTIONS = ("ESCALATE_TO_L2", "ESCALATE_TO_FIU", "BLOCK_IMMEDIATELY")
 
-runtime_state: Dict[str, Any] = {}
+_ENGINE_CACHE: Dict[str, Any] = {}
+runtime_state: Dict[str, Any] = _ENGINE_CACHE
 
 
 # ─────────────────────────────────────────────────────────────
@@ -88,8 +91,8 @@ def _safe_json(raw: Any, default: Any) -> Any:
 
 @contextmanager
 def db_conn(row_factory: bool = False):
-    """SQLite connection that is always closed (sqlite3's own `with` only commits)."""
-    conn = sqlite3.connect(DB_FILE, timeout=5.0)
+    """SQLite connection using WAL helper that is always closed."""
+    conn = get_db_connection(DB_FILE)
     if row_factory:
         conn.row_factory = sqlite3.Row
     try:
@@ -165,17 +168,20 @@ def load_slm():
 
 
 def get_engine() -> Dict[str, Any]:
-    if "model" not in runtime_state or runtime_state.get("model") is None:
+    global _ENGINE_CACHE, runtime_state
+    if "model" not in _ENGINE_CACHE or _ENGINE_CACHE.get("model") is None:
         torch.set_num_threads(int(os.getenv("VIGILANCE_TORCH_THREADS", "4")))
         if os.path.exists(TOKENIZER_PATH):
             model, variant = load_slm()
             if model is not None:
                 tokenizer = Tokenizer.from_file(TOKENIZER_PATH)
-                runtime_state["tokenizer"] = tokenizer
-                runtime_state["model"] = model
-                runtime_state["target_end_id"] = tokenizer.token_to_id("<|target_end|>")
-                runtime_state["model_tag"] = f"slm_{variant}_int8"
-    return runtime_state
+                _ENGINE_CACHE["tokenizer"] = tokenizer
+                _ENGINE_CACHE["model"] = model
+                _ENGINE_CACHE["target_end_id"] = tokenizer.token_to_id("<|target_end|>")
+                _ENGINE_CACHE["endoftext_id"] = tokenizer.token_to_id("<|endoftext|>")
+                _ENGINE_CACHE["model_tag"] = f"slm_{variant}_int8"
+    runtime_state.update(_ENGINE_CACHE)
+    return _ENGINE_CACHE
 
 
 @asynccontextmanager
@@ -183,8 +189,6 @@ async def lifespan(app: FastAPI):
     init_case_storage(DB_FILE)
     get_engine()
     yield
-    runtime_state.clear()
-
 
 
 app = FastAPI(title="VigilanceAI Financial Risk Platform", version="2.2.0", lifespan=lifespan)
@@ -368,6 +372,7 @@ def synthesize_slm_reasoning(
         model = engine.get("model")
         tokenizer = engine.get("tokenizer")
         target_end_id = engine.get("target_end_id")
+        endoftext_id = engine.get("endoftext_id")
 
         if model is None or tokenizer is None:
             return _rules_fallback(features, rules, latest_txs, account_id)
@@ -399,12 +404,16 @@ def synthesize_slm_reasoning(
                 idx_window = curr_ids if curr_ids.size(1) <= model.max_seq_len else curr_ids[:, -model.max_seq_len:]
                 logits, _ = model(idx_window)
                 next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
-                if target_end_id is not None and next_token.item() == target_end_id:
-                    break
+                tok_val = next_token.item()
                 curr_ids = torch.cat((curr_ids, next_token), dim=1)
+                if tok_val in (target_end_id, endoftext_id):
+                    break
+                gen_so_far = tokenizer.decode(curr_ids[0, prompt_len:].tolist())
+                if "\n\n" in gen_so_far or "<|endoftext|>" in gen_so_far or "<|target_end|>" in gen_so_far:
+                    break
 
         gen_tokens = curr_ids[0, prompt_len:].tolist()
-        raw_text = tokenizer.decode(gen_tokens).replace("<|target_end|>", "").strip()
+        raw_text = tokenizer.decode(gen_tokens).replace("<|target_end|>", "").replace("<|endoftext|>", "").strip()
         raw_decision = _parse_slm_output(raw_text)
     except Exception as e:
         print(f"[WARN] SLM generation error ({e}); using rules fallback.")

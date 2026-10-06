@@ -2,6 +2,7 @@ import sqlite3
 import json
 from typing import Dict, Any, List
 from service.schema import RiskAssessment
+from service.db_utils import get_db_connection
 
 DB_FILE = "audit_log.db"
 
@@ -25,10 +26,9 @@ def _safe_model_dict(obj) -> dict:
 
 
 def init_case_storage(db_file: str = DB_FILE):
-    with sqlite3.connect(db_file, timeout=5.0) as conn:
+    conn = get_db_connection(db_file)
+    try:
         cursor = conn.cursor()
-        cursor.execute("PRAGMA journal_mode=WAL;")
-        cursor.execute("PRAGMA busy_timeout=5000;")
 
         # Legacy audit table for chat and backward compatibility
         cursor.execute("""
@@ -87,10 +87,13 @@ def init_case_storage(db_file: str = DB_FILE):
             )
         """)
         conn.commit()
+    finally:
+        conn.close()
 
 
 def record_case(assessment: RiskAssessment, raw_payload: Dict[str, Any], db_file: str = DB_FILE):
-    with sqlite3.connect(db_file, timeout=5.0) as conn:
+    conn = get_db_connection(db_file)
+    try:
         cursor = conn.cursor()
 
         # Safe-serialize features, rules, and entity profile
@@ -144,23 +147,28 @@ def record_case(assessment: RiskAssessment, raw_payload: Dict[str, Any], db_file
             )
 
         conn.commit()
+    finally:
+        conn.close()
 
 
 def log_upload_batch(batch_id: str, filename: str, tx_count: int, account_ids: List[str], db_file: str = DB_FILE):
     # Logs uploaded file details and accounts evaluated in SQLite
-    with sqlite3.connect(db_file, timeout=5.0) as conn:
+    conn = get_db_connection(db_file)
+    try:
         cursor = conn.cursor()
         cursor.execute("""
             INSERT OR REPLACE INTO upload_history (batch_id, filename, uploaded_at, tx_count, account_count, account_ids_json)
             VALUES (?, ?, CURRENT_TIMESTAMP, ?, ?, ?)
         """, (batch_id, filename, tx_count, len(account_ids), json.dumps(account_ids)))
         conn.commit()
+    finally:
+        conn.close()
 
 
 def get_upload_history(db_file: str = DB_FILE) -> List[Dict[str, Any]]:
     # Retrieves all uploaded file batch records ordered by time
-    with sqlite3.connect(db_file, timeout=5.0) as conn:
-        conn.row_factory = sqlite3.Row
+    conn = get_db_connection(db_file)
+    try:
         cursor = conn.cursor()
         cursor.execute("""
             SELECT batch_id, filename, uploaded_at, tx_count, account_count, account_ids_json
@@ -178,11 +186,14 @@ def get_upload_history(db_file: str = DB_FILE) -> List[Dict[str, Any]]:
                 "account_ids": json.loads(r["account_ids_json"]) if r["account_ids_json"] else []
             })
         return result
+    finally:
+        conn.close()
 
 
 def delete_upload_batch(batch_id: str, db_file: str = DB_FILE) -> Dict[str, Any]:
     # Deletes all cases and audit records corresponding to an upload batch
-    with sqlite3.connect(db_file, timeout=5.0) as conn:
+    conn = get_db_connection(db_file)
+    try:
         cursor = conn.cursor()
         cursor.execute("SELECT filename, account_ids_json FROM upload_history WHERE batch_id = ?", (batch_id,))
         row = cursor.fetchone()
@@ -199,11 +210,14 @@ def delete_upload_batch(batch_id: str, db_file: str = DB_FILE) -> Dict[str, Any]
         cursor.execute("DELETE FROM upload_history WHERE batch_id = ?", (batch_id,))
         conn.commit()
         return {"status": "success", "filename": filename, "accounts_purged": len(accounts)}
+    finally:
+        conn.close()
 
 
 def purge_all_records(db_file: str = DB_FILE) -> Dict[str, Any]:
     # Clears all test case and audit data from SQLite
-    with sqlite3.connect(db_file, timeout=5.0) as conn:
+    conn = get_db_connection(db_file)
+    try:
         cursor = conn.cursor()
         cursor.execute("DELETE FROM risk_cases")
         cursor.execute("DELETE FROM screening_audit")
@@ -211,3 +225,5 @@ def purge_all_records(db_file: str = DB_FILE) -> Dict[str, Any]:
         cursor.execute("DELETE FROM upload_history")
         conn.commit()
         return {"status": "success", "message": "All records purged"}
+    finally:
+        conn.close()

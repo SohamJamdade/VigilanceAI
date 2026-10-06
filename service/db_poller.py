@@ -14,6 +14,7 @@ if BASE_DIR not in sys.path:
 
 from service.app import screen_account_hybrid, load_slm
 from service.cases import init_case_storage, DB_FILE
+from service.db_utils import get_db_connection
 
 DB_PATH = os.path.join(BASE_DIR, "core_banking.db")
 AUDIT_DB_PATH = os.path.join(BASE_DIR, "audit_log.db")
@@ -32,7 +33,8 @@ poller_telemetry: Dict[str, Any] = {
 
 def init_audit_db(audit_db_file: str = AUDIT_DB_PATH):
     init_case_storage(audit_db_file)
-    with sqlite3.connect(audit_db_file, timeout=5.0) as conn:
+    conn = get_db_connection(audit_db_file)
+    try:
         cur = conn.cursor()
         cur.execute("""
             CREATE TABLE IF NOT EXISTS alerts (
@@ -47,6 +49,8 @@ def init_audit_db(audit_db_file: str = AUDIT_DB_PATH):
             )
         """)
         conn.commit()
+    finally:
+        conn.close()
 
 
 
@@ -60,8 +64,8 @@ def poll_and_screen(db_path: str = DB_PATH, table: str = "transactions", audit_d
     scanned_count = 0
 
     try:
-        with sqlite3.connect(resolved_db, timeout=10.0) as conn:
-            conn.row_factory = sqlite3.Row
+        conn = get_db_connection(resolved_db)
+        try:
             cur = conn.cursor()
 
             # Verify table existence
@@ -111,7 +115,8 @@ def poll_and_screen(db_path: str = DB_PATH, table: str = "transactions", audit_d
                 result = screen_account_hybrid(account_id=acc_str, transactions=tx_list)
 
                 # Write alert to audit_log.db
-                with sqlite3.connect(audit_db_path, timeout=5.0) as audit_conn:
+                audit_conn = get_db_connection(audit_db_path)
+                try:
                     a_cur = audit_conn.cursor()
                     a_cur.execute("""
                         INSERT INTO alerts (account_id, risk_level, typology, recommended_action, narrative, evidence)
@@ -125,6 +130,8 @@ def poll_and_screen(db_path: str = DB_PATH, table: str = "transactions", audit_d
                         json.dumps(result.get("supporting_evidence", []))
                     ))
                     audit_conn.commit()
+                finally:
+                    audit_conn.close()
 
                 # Update screening_status in core_banking.db
                 tx_ids = [t.get("tx_id") or t.get("id") for t in tx_list if (t.get("tx_id") or t.get("id"))]
@@ -138,6 +145,8 @@ def poll_and_screen(db_path: str = DB_PATH, table: str = "transactions", audit_d
 
                 scanned_count += len(tx_list)
                 print(f"[+] Screened {acc_str} -> Result: {result.get('risk_level')} ({result.get('primary_typology')})", flush=True)
+        finally:
+            conn.close()
 
         poller_telemetry["total_scanned"] += scanned_count
         poller_telemetry["last_scan"] = datetime.now().strftime("%H:%M:%S")
