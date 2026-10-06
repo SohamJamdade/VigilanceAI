@@ -165,29 +165,27 @@ def load_slm():
     return None, None
 
 
+def get_engine() -> Dict[str, Any]:
+    if "model" not in runtime_state or runtime_state.get("model") is None:
+        torch.set_num_threads(int(os.getenv("VIGILANCE_TORCH_THREADS", "4")))
+        if os.path.exists(TOKENIZER_PATH):
+            model, variant = load_slm()
+            if model is not None:
+                tokenizer = Tokenizer.from_file(TOKENIZER_PATH)
+                runtime_state["tokenizer"] = tokenizer
+                runtime_state["model"] = model
+                runtime_state["target_end_id"] = tokenizer.token_to_id("<|target_end|>")
+                runtime_state["model_tag"] = f"slm_{variant}_int8"
+    return runtime_state
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_case_storage(DB_FILE)
-    torch.set_num_threads(int(os.getenv("VIGILANCE_TORCH_THREADS", "4")))
-
-    model, variant = (None, None)
-    if os.path.exists(TOKENIZER_PATH):
-        model, variant = load_slm()
-    else:
-        print(f"[WARN] Tokenizer missing: {TOKENIZER_PATH}")
-
-    if model is not None:
-        tokenizer = Tokenizer.from_file(TOKENIZER_PATH)
-        runtime_state["tokenizer"] = tokenizer
-        runtime_state["model"] = model
-        runtime_state["target_end_id"] = tokenizer.token_to_id("<|target_end|>")
-        runtime_state["model_tag"] = f"slm_{variant}_int8"
-    else:
-        # Keep the API (cases, chat, rules) alive; screening runs in rules-only mode.
-        print("[WARN] No usable SLM assets. Running rules-only.")
-
+    get_engine()
     yield
     runtime_state.clear()
+
 
 
 app = FastAPI(title="VigilanceAI Financial Risk Platform", version="2.2.0", lifespan=lifespan)
@@ -321,9 +319,13 @@ def synthesize_slm_reasoning(
 ) -> Dict[str, Any]:
     raw_decision: Optional[Dict[str, Any]] = None
     try:
-        model = runtime_state["model"]
-        tokenizer = runtime_state["tokenizer"]
-        target_end_id = runtime_state["target_end_id"]
+        engine = get_engine()
+        model = engine.get("model")
+        tokenizer = engine.get("tokenizer")
+        target_end_id = engine.get("target_end_id")
+
+        if model is None or tokenizer is None:
+            return _rules_fallback(features, rules)
 
         base_ctx = {
             "account_id": account_id,
@@ -359,9 +361,10 @@ def synthesize_slm_reasoning(
         raw_text = tokenizer.decode(gen_tokens).replace("<|target_end|>", "").strip()
         raw_decision = _parse_slm_output(raw_text)
     except Exception as e:
-        print(f"SLM fallback triggered: {e}")
+        print(f"[WARN] SLM generation error ({e}); using rules fallback.")
 
     return _sanitize_decision(raw_decision, features, rules)
+
 
 
 # ─────────────────────────────────────────────────────────────
@@ -517,6 +520,47 @@ def run_pipeline(
     return assessment
 
 
+def screen_account_hybrid(account_id: str, transactions: List[Dict[str, Any]]) -> Dict[str, Any]:
+    norm_txs: List[NormalizedTransaction] = []
+    for r in transactions:
+        norm_txs.append(NormalizedTransaction(
+            tx_id=str(r.get("tx_id", f"TXN-{uuid.uuid4().hex[:6]}")),
+            account_id=account_id,
+            amount=float(r.get("amount", 0.0)),
+            currency=str(r.get("currency", "INR")),
+            rail=str(r.get("rail", "IMPS")).upper(),
+            recipient=str(r.get("recipient") or r.get("to") or "UNKNOWN"),
+            device_id=str(r.get("device_id") or r.get("device") or "DEV-UNKNOWN"),
+            timestamp=datetime.now(timezone.utc),
+            location=str(r.get("location", "DOMESTIC")),
+            source_hash="HYBRID_POLLER"
+        ))
+    raw_payload = {
+        "subject_account": account_id,
+        "batch_records": [
+            {
+                "tx_id": t.tx_id,
+                "amount": t.amount,
+                "rail": t.rail,
+                "recipient": t.recipient,
+                "device": t.device_id,
+                "location": t.location
+            } for t in norm_txs
+        ]
+    }
+    assessment = run_pipeline(account_id, norm_txs, raw_payload)
+    evidence = [r.reason for r in assessment.triggered_rules if r.triggered]
+    return {
+        "account_id": account_id,
+        "risk_level": assessment.confidence_level,
+        "primary_typology": assessment.primary_typology,
+        "recommended_action": assessment.recommended_action,
+        "narrative": assessment.slm_reasoning,
+        "supporting_evidence": evidence
+    }
+
+
+
 # ─────────────────────────────────────────────────────────────
 # Screening endpoints (plain `def` → run in FastAPI's threadpool,
 # so model inference no longer blocks chat / case endpoints)
@@ -651,37 +695,47 @@ class ChatQuery(BaseModel):
 
 
 def _resolve_account(query: str, cursor: sqlite3.Cursor) -> Tuple[Optional[str], List[str]]:
-    """Returns (account, ambiguous_candidates). Whole-token matching only,
-    so '100' no longer matches ACC-10001 and ACC-10002."""
-    cursor.execute(
-        "SELECT DISTINCT subject_account FROM screening_audit "
-        "UNION SELECT DISTINCT account_id FROM risk_cases"
-    )
+    cursor.execute("""
+        SELECT DISTINCT subject_account FROM screening_audit WHERE subject_account IS NOT NULL
+        UNION 
+        SELECT DISTINCT account_id FROM risk_cases WHERE account_id IS NOT NULL
+    """)
     known = [r[0] for r in cursor.fetchall() if r[0]]
     if not known:
         return None, []
 
-    q_upper = query.upper()
+    # Strip literal occurrences of 'account' / 'accounts' to prevent ACC-OUNT collision
+    sanitized = re.sub(r"\baccounts?\b", " ", query, flags=re.IGNORECASE)
 
-    # 1) Full account id appearing in the query (longest wins).
+    # Normalize spaced or punctuated ACC patterns: "ACC - 40005", "ACC 10002" -> "ACC-40005"
+    sanitized = re.sub(r"\bACC\s*[\-_]?\s*([A-Za-z0-9\-]+)\b", r"ACC-\1", sanitized, flags=re.IGNORECASE)
+    sanitized_upper = sanitized.upper()
+
+    # Full account ID match appearing in sanitized query (longest wins)
     exact = [
         acc for acc in known
-        if re.search(rf'(?<![A-Z0-9]){re.escape(acc.upper())}(?![A-Z0-9])', q_upper)
+        if re.search(rf'(?<![A-Z0-9]){re.escape(acc.upper())}(?![A-Z0-9])', sanitized_upper)
     ]
     if exact:
         return max(exact, key=len), []
 
-    # 2) A number in the query that is a whole numeric segment of exactly one account.
+    # Whole numeric segment or suffix matching
     candidates: List[str] = []
-    for token in re.findall(r'(?<![A-Za-z0-9])\d{3,8}(?![A-Za-z0-9])', query):
+    digits_found = re.findall(r'(?<![A-Za-z0-9])\d{2,8}(?![A-Za-z0-9])', sanitized)
+    for token in digits_found:
         for acc in known:
-            if re.search(rf'(?<!\d){re.escape(token)}(?!\d)', acc) and acc not in candidates:
+            if acc.upper() == f"ACC-{token}" or acc.upper().endswith(f"-{token}"):
+                if acc not in candidates:
+                    candidates.append(acc)
+            elif re.search(rf'(?<!\d){re.escape(token)}(?!\d)', acc) and acc not in candidates:
                 candidates.append(acc)
+
     if len(candidates) == 1:
         return candidates[0], []
     if len(candidates) > 1:
         return None, candidates
     return None, []
+
 
 
 def _has(pattern: str, text: str) -> bool:

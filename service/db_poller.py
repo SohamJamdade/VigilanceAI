@@ -1,17 +1,22 @@
 import os
-import json
+import sys
 import time
+import json
 import sqlite3
 import threading
 import pandas as pd
-import requests
-import uuid
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 
-API_BASE = os.getenv("VIGILANCE_API_URL", "http://localhost:8000")
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SECONDS", "60"))
-DEFAULT_CONFIG = "db_credentials.json"
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if BASE_DIR not in sys.path:
+    sys.path.append(BASE_DIR)
+
+from service.app import screen_account_hybrid, load_slm
+
+DB_PATH = os.path.join(BASE_DIR, "core_banking.db")
+AUDIT_DB_PATH = os.path.join(BASE_DIR, "audit_log.db")
+DEFAULT_CONFIG = os.path.join(BASE_DIR, "db_credentials.json")
 
 poller_telemetry: Dict[str, Any] = {
     "status": "IDLE",
@@ -19,126 +24,117 @@ poller_telemetry: Dict[str, Any] = {
     "next_scan": None,
     "total_scanned": 0,
     "last_error": None,
-    "db_path": None,
+    "db_path": DB_PATH,
     "table": "transactions",
 }
 
 
-def run_single_scan(db_path: str = "core_banking.db", table: str = "transactions") -> int:
-    resolved_path = os.path.abspath(db_path)
-    if not os.path.exists(resolved_path):
-        poller_telemetry["last_error"] = f"Database not found at {resolved_path}"
+def init_audit_db(audit_db_file: str = AUDIT_DB_PATH):
+    with sqlite3.connect(audit_db_file, timeout=5.0) as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account_id TEXT NOT NULL,
+                risk_level TEXT NOT NULL,
+                typology TEXT NOT NULL,
+                recommended_action TEXT NOT NULL,
+                narrative TEXT NOT NULL,
+                evidence JSON,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.commit()
+
+
+def poll_and_screen(db_path: str = DB_PATH, table: str = "transactions", audit_db_path: str = AUDIT_DB_PATH) -> int:
+    resolved_db = os.path.abspath(db_path)
+    if not os.path.exists(resolved_db):
+        poller_telemetry["last_error"] = f"Database not found at {resolved_db}"
         return 0
 
-    api_url = os.getenv("VIGILANCE_API_URL", API_BASE)
+    init_audit_db(audit_db_path)
     scanned_count = 0
 
     try:
-        with sqlite3.connect(resolved_path, timeout=10.0) as conn:
+        with sqlite3.connect(resolved_db, timeout=10.0) as conn:
             conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
+            cur = conn.cursor()
 
-            table_check = cursor.execute(
+            # Verify table existence
+            table_check = cur.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name=?;", (table,)
             ).fetchone()
             if not table_check:
-                poller_telemetry["last_error"] = f"Table '{table}' does not exist in {resolved_path}"
+                poller_telemetry["last_error"] = f"Table '{table}' does not exist in {resolved_db}"
                 return 0
 
-            # Ensure screening_status column exists in user database table
-            col_info = cursor.execute(f"PRAGMA table_info('{table}')").fetchall()
+            # Ensure screening_status column exists in database table
+            col_info = cur.execute(f"PRAGMA table_info('{table}')").fetchall()
             col_names = [c[1] for c in col_info]
             if "screening_status" not in col_names:
-                cursor.execute(f"ALTER TABLE '{table}' ADD COLUMN screening_status TEXT DEFAULT 'PENDING'")
+                cur.execute(f"ALTER TABLE '{table}' ADD COLUMN screening_status TEXT DEFAULT 'PENDING'")
                 conn.commit()
 
-            # Fetch pending records
-            cursor.execute(f"""
+            # Query pending transactions from core_banking table
+            cur.execute(f"""
                 SELECT * FROM '{table}' 
                 WHERE screening_status = 'PENDING' OR screening_status IS NULL 
                 LIMIT 100
             """)
-            rows = cursor.fetchall()
+            rows = cur.fetchall()
+
             if not rows:
+                print("[*] Poller: No PENDING transactions found. Waiting...", flush=True)
                 poller_telemetry["last_scan"] = datetime.now().strftime("%H:%M:%S")
                 poller_telemetry["status"] = "IDLE (0 pending records)"
                 poller_telemetry["last_error"] = None
                 return 0
 
-            grouped: Dict[str, List[Dict[str, Any]]] = {}
-            for r in rows:
-                d = dict(r)
-                acc = str(d.get("account_id") or d.get("account") or d.get("user_id") or "ACC-UNKNOWN")
-                grouped.setdefault(acc, []).append(d)
+            print(f"[*] Poller: Found {len(rows)} pending transactions. Grouping by account...", flush=True)
 
-            for acc, tx_list in grouped.items():
-                amounts = [float(t.get("amount") or 0.0) for t in tx_list]
-                dyn_median = float(pd.Series(amounts).median()) if amounts else 0.0
+            raw_dict = [dict(r) for r in rows]
+            cols = list(raw_dict[0].keys())
+            df = pd.DataFrame(raw_dict, columns=cols)
 
-                batch_records = []
-                for t in tx_list:
-                    raw_id = t.get("tx_id") or t.get("id") or f"TXN-{uuid.uuid4().hex[:6]}"
-                    batch_records.append({
-                        "tx_id": str(raw_id),
-                        "amount": float(t.get("amount") or 0.0),
-                        "rail": str(t.get("rail") or "IMPS"),
-                        "recipient": str(t.get("recipient") or "UNKNOWN"),
-                        "device_id": str(t.get("device_id") or t.get("device") or "DEV-UNKNOWN"),
-                        "location": str(t.get("location") or "DOMESTIC")
-                    })
+            account_col = "account_id" if "account_id" in df.columns else cols[1]
 
-                payload = {
-                    "subject_account": acc,
-                    "batch_records": batch_records,
-                    "account_baseline": {
-                        "account_id": acc,
-                        "historical_median": dyn_median,
-                        "typical_bracket": [min(amounts), max(amounts)] if amounts else [0.0, 0.0]
-                    }
-                }
+            for account_id, group in df.groupby(account_col):
+                tx_list = group.to_dict(orient="records")
+                acc_str = str(account_id)
+                print(f"[*] Screening account {acc_str} with {len(tx_list)} transactions...", flush=True)
 
-                # Dispatch via HTTP or fallback to local pipeline execution
-                success = False
-                try:
-                    resp = requests.post(f"{api_url}/v1/screen", json=payload, timeout=15)
-                    if resp.status_code == 200:
-                        success = True
-                except Exception:
-                    pass
+                # Run hybrid evaluation via 130M SLM engine
+                result = screen_account_hybrid(account_id=acc_str, transactions=tx_list)
 
-                if not success:
-                    try:
-                        from service.app import run_pipeline, NormalizedTransaction
-                        norm_txs = [
-                            NormalizedTransaction(
-                                tx_id=r["tx_id"],
-                                account_id=acc,
-                                amount=r["amount"],
-                                currency="INR",
-                                rail=r["rail"].upper(),
-                                recipient=r["recipient"],
-                                device_id=r["device_id"],
-                                timestamp=datetime.now(timezone.utc),
-                                location=r["location"],
-                                source_hash="DB_SCAN_LOCAL"
-                            ) for r in batch_records
-                        ]
-                        run_pipeline(acc, norm_txs, payload)
-                        success = True
-                    except Exception as pipe_err:
-                        poller_telemetry["last_error"] = f"Pipeline error: {pipe_err}"
+                # Write alert to audit_log.db
+                with sqlite3.connect(audit_db_path, timeout=5.0) as audit_conn:
+                    a_cur = audit_conn.cursor()
+                    a_cur.execute("""
+                        INSERT INTO alerts (account_id, risk_level, typology, recommended_action, narrative, evidence)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (
+                        acc_str,
+                        result.get("risk_level", "LOW"),
+                        result.get("primary_typology", "NORMAL_ACTIVITY"),
+                        result.get("recommended_action", "AUTO_CLEAR"),
+                        result.get("narrative", ""),
+                        json.dumps(result.get("supporting_evidence", []))
+                    ))
+                    audit_conn.commit()
 
-                if success:
-                    for t in tx_list:
-                        row_id = t.get("id")
-                        tx_id_val = t.get("tx_id")
-                        if row_id is not None:
-                            cursor.execute(f"UPDATE '{table}' SET screening_status = 'SCREENED' WHERE id = ?", (row_id,))
-                        elif tx_id_val is not None:
-                            cursor.execute(f"UPDATE '{table}' SET screening_status = 'SCREENED' WHERE tx_id = ?", (tx_id_val,))
-                    scanned_count += len(tx_list)
+                # Update screening_status in core_banking.db
+                tx_ids = [t.get("tx_id") or t.get("id") for t in tx_list if (t.get("tx_id") or t.get("id"))]
+                if tx_ids:
+                    placeholders = ",".join("?" for _ in tx_ids)
+                    if "tx_id" in group.columns and group["tx_id"].notna().any():
+                        cur.execute(f"UPDATE '{table}' SET screening_status = 'SCREENED' WHERE tx_id IN ({placeholders})", tx_ids)
+                    else:
+                        cur.execute(f"UPDATE '{table}' SET screening_status = 'SCREENED' WHERE id IN ({placeholders})", tx_ids)
+                    conn.commit()
 
-            conn.commit()
+                scanned_count += len(tx_list)
+                print(f"[+] Screened {acc_str} -> Result: {result.get('risk_level')} ({result.get('primary_typology')})", flush=True)
 
         poller_telemetry["total_scanned"] += scanned_count
         poller_telemetry["last_scan"] = datetime.now().strftime("%H:%M:%S")
@@ -147,8 +143,13 @@ def run_single_scan(db_path: str = "core_banking.db", table: str = "transactions
         return scanned_count
 
     except Exception as e:
+        print(f"[!] Error in poller cycle: {e}", flush=True)
         poller_telemetry["last_error"] = str(e)
         return 0
+
+
+def run_single_scan(db_path: str = DB_PATH, table: str = "transactions") -> int:
+    return poll_and_screen(db_path=db_path, table=table)
 
 
 class AutomatedDBPoller:
@@ -158,7 +159,6 @@ class AutomatedDBPoller:
         db_path: Optional[str] = None,
         table: Optional[str] = None,
         poll_interval: Optional[int] = None,
-        api_base: Optional[str] = None,
     ):
         cfg = {}
         if os.path.exists(config_path):
@@ -168,10 +168,9 @@ class AutomatedDBPoller:
             except Exception as e:
                 poller_telemetry["last_error"] = f"Failed to read credentials: {e}"
 
-        self.db_path = db_path or cfg.get("database") or cfg.get("db_path") or "core_banking.db"
+        self.db_path = db_path or cfg.get("database") or cfg.get("db_path") or DB_PATH
         self.table = table or cfg.get("table") or "transactions"
-        self.poll_interval = poll_interval or cfg.get("poll_interval_seconds") or POLL_INTERVAL
-        self.api_base = api_base or os.getenv("VIGILANCE_API_URL", API_BASE)
+        self.poll_interval = poll_interval or cfg.get("poll_interval_seconds") or 3
 
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -231,3 +230,14 @@ def stop_poller():
 def is_running() -> bool:
     global _global_poller
     return _global_poller is not None and _global_poller.is_running()
+
+
+if __name__ == "__main__":
+    print("[*] Starting VigilanceAI Database Screening Poller...", flush=True)
+    load_slm()
+    while True:
+        try:
+            poll_and_screen()
+        except Exception as e:
+            print(f"[!] Error in poller cycle: {e}", flush=True)
+        time.sleep(3)

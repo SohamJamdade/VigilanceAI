@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import time
+import re
 import uuid
 from datetime import datetime
 
@@ -21,6 +22,8 @@ from service.cases import (
 )
 
 API_BASE = os.getenv("VIGILANCE_API_URL", "http://localhost:8000")
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+AUDIT_DB_PATH = os.path.join(BASE_DIR, "audit_log.db")
 
 st.set_page_config(page_title="VigilanceAI — Compliance Workstation", page_icon="🛡️", layout="wide")
 
@@ -40,8 +43,159 @@ def fast_purge_cases():
     except Exception:
         pass
 
+    if os.path.exists(AUDIT_DB_PATH):
+        try:
+            with sqlite3.connect(AUDIT_DB_PATH) as conn:
+                conn.cursor().execute("DELETE FROM alerts")
+                conn.commit()
+            purged = True
+        except Exception:
+            pass
+
     st.cache_data.clear()
     return purged
+
+def query_compliance_assistant(query_text: str) -> str:
+    """Robust compliance assistant querying audit_log.db with fuzzy token matching."""
+    if not os.path.exists(AUDIT_DB_PATH):
+        return "⚠️ `audit_log.db` not found. Please run `service/db_poller.py` to generate audit records."
+
+    raw_query = query_text.strip()
+    q_lower = raw_query.lower()
+
+    # 1. Sanitize query by stripping literal 'account' / 'accounts' words to prevent ACC-OUNT collision
+    sanitized = re.sub(r"\baccounts?\b", " ", raw_query, flags=re.IGNORECASE)
+
+    target_account = None
+
+    # 2. Normalize spaced or punctuated ACC patterns: "ACC - 40005", "ACC 10002", "ACC-DROP-99" -> "ACC-40005"
+    acc_match = re.search(r"\bACC\s*[\-_]?\s*([A-Za-z0-9\-]+)\b", sanitized, flags=re.IGNORECASE)
+    if acc_match:
+        suffix = acc_match.group(1).strip("-").upper()
+        if suffix:
+            target_account = f"ACC-{suffix}"
+    else:
+        # Check for bare 2-6 digit numeric account IDs: e.g. 10002, 40005, 99
+        digits_match = re.search(r"\b(\d{2,6})\b", sanitized)
+        if digits_match:
+            target_account = f"ACC-{digits_match.group(1)}"
+
+
+    with sqlite3.connect(AUDIT_DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+
+        def table_exists(tbl_name: str) -> bool:
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (tbl_name,))
+            return cur.fetchone() is not None
+
+        if not table_exists("alerts") and not table_exists("risk_cases"):
+            return "No audit tables (`alerts` / `risk_cases`) found in `audit_log.db`."
+
+        # PRIORITY 1: Specific Account Query (runs even if the word 'flagged' is in the query)
+        if target_account:
+            clean_suffix = target_account.replace("ACC-", "")
+            row = None
+
+            if table_exists("alerts"):
+                cur.execute("""
+                    SELECT account_id, risk_level, typology, recommended_action, narrative, evidence, timestamp 
+                    FROM alerts 
+                    WHERE UPPER(account_id) = ? 
+                       OR UPPER(account_id) = ?
+                       OR account_id LIKE ? 
+                       OR account_id LIKE ?
+                    ORDER BY id DESC LIMIT 1
+                """, (target_account.upper(), clean_suffix.upper(), f"%{target_account}%", f"%{clean_suffix}%"))
+                row = cur.fetchone()
+
+            if not row and table_exists("risk_cases"):
+                cur.execute("""
+                    SELECT account_id, risk_level, primary_typology as typology, recommended_action,
+                           model_reasoning as narrative, triggered_rules_json as evidence, created_at as timestamp
+                    FROM risk_cases
+                    WHERE UPPER(account_id) = ? 
+                       OR UPPER(account_id) = ?
+                       OR account_id LIKE ? 
+                       OR account_id LIKE ?
+                    ORDER BY created_at DESC LIMIT 1
+                """, (target_account.upper(), clean_suffix.upper(), f"%{target_account}%", f"%{clean_suffix}%"))
+                row = cur.fetchone()
+
+
+            if row:
+                ev_str = ""
+                if row["evidence"]:
+                    try:
+                        ev_list = json.loads(row["evidence"]) if isinstance(row["evidence"], str) else row["evidence"]
+                        if isinstance(ev_list, list):
+                            ev_str = "\n" + "\n".join([f"- {e}" for e in ev_list])
+                        elif isinstance(ev_list, dict):
+                            ev_str = "\n" + "\n".join([f"- **{k}**: {v}" for k, v in ev_list.items()])
+                        else:
+                            ev_str = f"\n- {ev_list}"
+                    except Exception:
+                        ev_str = f"\n- {row['evidence']}"
+
+                narrative_text = row['narrative'] if row['narrative'] else "High-risk typology triggered by rule evaluation and model inference."
+                risk_icon = "🔴" if row['risk_level'] == "CRITICAL" else ("🟠" if row['risk_level'] == "HIGH" else "🟢")
+
+                return f"""### {risk_icon} Case Dossier: `{row['account_id']}`
+- **Risk Classification:** **`{row['risk_level']}`**
+- **Identified Typology:** `{row['typology']}`
+- **Recommended Action:** `{row['recommended_action']}`
+- **Evaluation Timestamp:** `{row['timestamp']}`
+
+---
+**🧠 SLM Reasoning & Narrative:**
+> {narrative_text}
+
+{f"**📋 Triggered Evidence & Indicators:**{ev_str}" if ev_str else ""}"""
+            else:
+                return f"No flagged records found for account `{target_account}`. All transactions conform to baseline."
+
+        # PRIORITY 2: General Flagged Accounts List
+        if any(kw in q_lower for kw in ["flagged", "alert", "alerts", "suspicious", "high risk", "critical", "smurfing", "sanctions"]):
+            cur.execute("""
+                SELECT account_id, risk_level, typology, recommended_action 
+                FROM alerts 
+                WHERE risk_level IN ('HIGH', 'CRITICAL')
+                ORDER BY id DESC
+            """)
+            flagged_rows = cur.fetchall()
+            if not flagged_rows:
+                return "✅ All screened accounts currently conform to baseline. No high-risk or critical alerts recorded."
+
+            unique_accs = {r["account_id"]: r for r in flagged_rows}
+            lines = [f"### 🚨 Flagged Accounts ({len(unique_accs)} High/Critical Alerts):"]
+            for acc, r in unique_accs.items():
+                icon = "🔴" if r["risk_level"] == "CRITICAL" else "🟠"
+                lines.append(f"- {icon} **`{acc}`** | Risk: **{r['risk_level']}** | Typology: `{r['typology']}` | Action: `{r['recommended_action']}`")
+            lines.append("\n*Ask `Why is account <id> flagged?` to review full SLM reasoning and evidence.*")
+            return "\n".join(lines)
+
+        # PRIORITY 3: Risk Overview / Metrics
+        if any(kw in q_lower for kw in ["overview", "summary", "stats", "telemetry", "distribution"]):
+            cur.execute("SELECT risk_level, COUNT(*) as cnt FROM alerts GROUP BY risk_level")
+            summary_counts = {row["risk_level"]: row["cnt"] for row in cur.fetchall()}
+            total_alerts = sum(summary_counts.values())
+            return f"""### 📊 Current Risk Overview:
+- **Total Screened Alerts:** {total_alerts}
+- 🔴 **CRITICAL:** {summary_counts.get('CRITICAL', 0)}
+- 🟠 **HIGH:** {summary_counts.get('HIGH', 0)}
+- 🟡 **MEDIUM:** {summary_counts.get('MEDIUM', 0)}
+- 🟢 **LOW / NORMAL:** {summary_counts.get('LOW', 0)}
+
+Ask for **'accounts flagged'** or **'Why is account <id> flagged?'** for case specifics."""
+
+        # Default fallback
+        cur.execute("SELECT account_id, risk_level, typology FROM alerts ORDER BY id DESC LIMIT 5")
+        recent = cur.fetchall()
+        if recent:
+            recs = ", ".join([f"`{r['account_id']}` ({r['risk_level']})" for r in recent])
+            return f"I can review flagged accounts and risk dossiers. Recent accounts in audit log: {recs}.\n\nTry asking:\n- *'Why is account ACC-40005 flagged?'*\n- *'Why is ACC-DROP-99 flagged?'*\n- *'Show flagged accounts'*\n- *'Risk overview'*"
+        else:
+            return "All screened accounts currently conform to baseline. No high-risk alerts."
 
 THEME_CSS = """
 <style>
@@ -62,11 +216,6 @@ THEME_CSS = """
 }
 h1,h2,h3,h4, [data-testid="stMetricValue"] { font-family:'Sora','Manrope',sans-serif !important; letter-spacing:-.02em; }
 
-[data-testid="stIconMaterial"], span[class*="material"], .material-icons, .material-symbols-rounded{
-  font-family:'Material Symbols Rounded','Material Symbols Outlined','Material Icons' !important;
-  letter-spacing:normal !important;
-}
-
 .stApp{
   background:
     radial-gradient(1100px 520px at 12% -8%, rgba(124,140,255,.20), transparent 60%),
@@ -84,20 +233,11 @@ header[data-testid="stHeader"]{ background:transparent; }
   position:relative; overflow:hidden; border-radius:22px; padding:34px 38px; margin-bottom:22px;
   background:linear-gradient(135deg, rgba(22,32,63,.92), rgba(12,18,40,.92));
   box-shadow:var(--glow);
-  animation:vg-rise .9s cubic-bezier(.2,.8,.2,1) both;
 }
-.vg-hero::before, .vg-hero::after{
-  content:""; position:absolute; width:420px; height:420px; border-radius:50%; filter:blur(70px); opacity:.55;
-  animation:vg-drift 14s ease-in-out infinite alternate;
-}
-.vg-hero::before{ background:#5B6CFF; top:-220px; left:-80px; }
-.vg-hero::after { background:#12B8D6; bottom:-260px; right:-60px; animation-delay:-7s; }
-.vg-hero > *{ position:relative; z-index:1; }
 .vg-hero h1{
   margin:0; font-size:2.5rem; font-weight:700; line-height:1.1;
   background:linear-gradient(100deg,#FFFFFF 10%, #B9C3FF 55%, #8EEBFF 100%);
-  background-size:200% auto; -webkit-background-clip:text; background-clip:text; color:transparent;
-  animation:vg-sheen 7s linear infinite;
+  -webkit-background-clip:text; background-clip:text; color:transparent;
 }
 .vg-hero p{ margin:.55rem 0 0; color:#B4BEDD; font-size:1.02rem; max-width:62ch; }
 .vg-chips{ display:flex; flex-wrap:wrap; gap:8px; margin-top:20px; }
@@ -105,25 +245,18 @@ header[data-testid="stHeader"]{ background:transparent; }
   padding:6px 13px; border-radius:999px; font-size:.78rem; font-weight:600; color:#D5DCFF;
   background:rgba(255,255,255,.06); border:1px solid rgba(255,255,255,.10); backdrop-filter:blur(8px);
 }
-@keyframes vg-rise{ from{opacity:0; transform:translateY(14px) scale(.985);} to{opacity:1; transform:none;} }
-@keyframes vg-sheen{ to{ background-position:200% center; } }
-@keyframes vg-drift{ from{ transform:translate(0,0) scale(1);} to{ transform:translate(70px,40px) scale(1.15);} }
-@keyframes vg-pulse{ 0%{ box-shadow:0 0 0 0 rgba(52,211,153,.6);} 100%{ box-shadow:0 0 0 12px rgba(52,211,153,0);} }
 
 [data-testid="stSidebar"]{
   background:linear-gradient(180deg,#0C1330 0%, #080D1A 100%);
   border-right:1px solid var(--line);
 }
-[data-testid="stSidebar"] img{ filter:drop-shadow(0 6px 18px rgba(124,140,255,.45)); }
-[data-testid="stSidebar"] h1{ font-size:1.6rem; margin-bottom:0; }
-[data-testid="stSidebar"] hr{ border-color:var(--line); }
 .vg-pill{
   display:flex; align-items:center; gap:10px; padding:11px 14px; border-radius:14px;
   font-weight:600; font-size:.88rem; border:1px solid var(--line); background:rgba(255,255,255,.03);
 }
 .vg-dot{ width:9px; height:9px; border-radius:50%; background:#5A6690; flex:none; }
 .vg-pill.on{ color:#B9F5DD; border-color:rgba(52,211,153,.35); background:rgba(52,211,153,.08); }
-.vg-pill.on .vg-dot{ background:var(--ok); animation:vg-pulse 1.6s ease-out infinite; }
+.vg-pill.on .vg-dot{ background:var(--ok); }
 .vg-pill.off{ color:var(--muted); }
 
 .stTabs [data-baseweb="tab-list"]{
@@ -132,91 +265,32 @@ header[data-testid="stHeader"]{ background:transparent; }
 }
 .stTabs [data-baseweb="tab"]{
   height:42px; padding:0 18px; border-radius:11px; color:var(--muted); font-weight:600;
-  transition:color .2s, background .2s;
 }
-.stTabs [data-baseweb="tab"]:hover{ color:var(--text); background:rgba(255,255,255,.05); }
 .stTabs [aria-selected="true"]{
   color:#fff !important; background:linear-gradient(135deg, rgba(124,140,255,.35), rgba(34,211,238,.20));
   box-shadow:inset 0 0 0 1px rgba(160,175,255,.35);
 }
-.stTabs [data-baseweb="tab-highlight"], .stTabs [data-baseweb="tab-border"]{ display:none; }
 
-h2{ font-size:1.65rem !important; font-weight:700 !important; }
-h3{ font-size:1.2rem !important; font-weight:600 !important; color:#DDE3FF; }
-[data-testid="stCaptionContainer"]{ color:var(--muted); }
-hr{ border-color:var(--line) !important; }
-
-.stButton > button, .stDownloadButton > button{
+.stButton > button{
   border-radius:12px; font-weight:700; padding:.6rem 1.1rem; color:var(--text);
   background:var(--raised); border:1px solid var(--line);
-  transition:transform .18s ease, box-shadow .18s ease, border-color .18s ease, background .18s ease;
 }
-.stButton > button:hover{
-  transform:translateY(-2px); border-color:rgba(160,175,255,.55); background:#1D2A52;
-  box-shadow:0 10px 24px -10px rgba(124,140,255,.55);
-}
-.stButton > button:active{ transform:translateY(0) scale(.98); }
 .stButton > button[kind="primary"]{
   border:none; color:#fff;
   background:linear-gradient(120deg,#6C7DFF 0%, #4F8CFF 50%, #22B8E0 100%);
-  background-size:160% 100%; background-position:0 0;
-  box-shadow:0 12px 28px -12px rgba(92,120,255,.8);
-}
-.stButton > button[kind="primary"]:hover{ background-position:100% 0; box-shadow:0 16px 34px -12px rgba(92,140,255,.95); }
-.stButton > button:disabled{ opacity:.42; transform:none; box-shadow:none; }
-
-[data-testid="stFileUploader"] section{
-  border-radius:18px; border:1.5px dashed rgba(140,155,255,.38);
-  background:linear-gradient(180deg, rgba(124,140,255,.07), rgba(34,211,238,.03));
-  transition:border-color .2s, background .2s, box-shadow .2s;
-}
-[data-testid="stFileUploader"] section:hover{
-  border-color:var(--accent2); box-shadow:0 0 0 4px rgba(34,211,238,.08);
-}
-[data-testid="stFileUploaderFile"]{ border-radius:12px; }
-
-[data-testid="stVerticalBlockBorderWrapper"]{
-  border-radius:16px; border-color:var(--line) !important;
 }
 
 [data-testid="stExpander"]{
   border:1px solid var(--line) !important; border-radius:16px !important; overflow:hidden;
   background:linear-gradient(180deg, rgba(22,32,63,.7), rgba(13,20,42,.7));
-  box-shadow:0 14px 30px -20px rgba(0,0,0,.8); margin-bottom:10px;
-  transition:border-color .2s, box-shadow .2s;
+  margin-bottom:10px;
 }
-[data-testid="stExpander"]:hover{ border-color:rgba(160,175,255,.42) !important; }
-[data-testid="stExpander"] summary{ padding:14px 18px; font-weight:700; }
-[data-testid="stExpander"] summary:hover{ background:rgba(255,255,255,.03); }
-[data-testid="stExpander"] details[open] summary{ border-bottom:1px solid var(--line); }
-[data-testid="stExpanderDetails"]{ padding:18px; animation:vg-open .35s ease both; }
-@keyframes vg-open{ from{ opacity:0; transform:translateY(-6px);} to{ opacity:1; transform:none;} }
-
-[data-testid="stMetric"]{
-  padding:16px 18px; border-radius:16px; border:1px solid var(--line);
-  background:linear-gradient(160deg, rgba(124,140,255,.12), rgba(255,255,255,.02));
-  box-shadow:var(--glow);
-}
-[data-testid="stMetricLabel"]{ color:var(--muted); font-weight:600; }
-[data-testid="stMetricValue"]{
-  font-weight:700; font-size:1.7rem;
-  background:linear-gradient(100deg,#fff,#B9C3FF); -webkit-background-clip:text; background-clip:text; color:transparent;
-}
-
-[data-testid="stAlert"]{
-  border-radius:14px; border:1px solid var(--line); backdrop-filter:blur(6px);
-}
-[data-testid="stAlert"]:has([data-testid="stAlertContentSuccess"]){ background:rgba(52,211,153,.10); border-color:rgba(52,211,153,.35); }
-[data-testid="stAlert"]:has([data-testid="stAlertContentInfo"]){ background:rgba(124,140,255,.10); border-color:rgba(124,140,255,.32); }
-[data-testid="stAlert"]:has([data-testid="stAlertContentWarning"]){ background:rgba(251,191,36,.10); border-color:rgba(251,191,36,.35); }
-[data-testid="stAlert"]:has([data-testid="stAlertContentError"]){ background:rgba(244,63,94,.11); border-color:rgba(244,63,94,.40); }
 
 [data-baseweb="input"]{
   border-radius:12px !important; background:#111A36 !important;
-  border:1px solid var(--line) !important; transition:border-color .2s, box-shadow .2s;
+  border:1px solid var(--line) !important;
 }
 [data-baseweb="base-input"], .stTextInput input{ background:transparent !important; border-radius:12px !important; }
-[data-baseweb="input"]:focus-within{ border-color:var(--accent2) !important; box-shadow:0 0 0 3px rgba(34,211,238,.15); }
 
 [data-testid="stChatMessage"]{
   border-radius:18px; border:1px solid var(--line); padding:14px 18px;
@@ -224,15 +298,7 @@ hr{ border-color:var(--line) !important; }
 }
 [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]){
   background:linear-gradient(135deg, rgba(124,140,255,.22), rgba(34,211,238,.10));
-  border-color:rgba(160,175,255,.35);
 }
-[data-testid="stChatInput"]{ border-radius:16px; }
-[data-testid="stChatInput"] > div{
-  border-radius:16px; border:1px solid rgba(160,175,255,.30); background:rgba(15,23,48,.9);
-  transition:box-shadow .2s, border-color .2s;
-}
-[data-testid="stChatInput"] > div:focus-within{ border-color:var(--accent2); box-shadow:0 0 0 3px rgba(34,211,238,.15); }
-
 code{ background:rgba(124,140,255,.14) !important; color:#CFD6FF !important; border-radius:7px; padding:.12em .45em; }
 </style>
 """
@@ -245,7 +311,7 @@ st.markdown("""
   <div class="vg-chips">
     <span class="vg-chip">Deterministic rules</span>
     <span class="vg-chip">Entity linkage</span>
-    <span class="vg-chip">15.2M INT8 SLM</span>
+    <span class="vg-chip">130M INT8 SLM</span>
     <span class="vg-chip">Immutable case store</span>
   </div>
 </div>
@@ -262,7 +328,7 @@ with st.sidebar:
     - 📐 Deterministic Feature Engine
     - ⚖️ Compliance Rule Engine
     - 🕸️ Entity Linkage Resolver
-    - 🧠 15.2M INT8 PyTorch SLM
+    - 🧠 130M INT8 PyTorch SLM
     - 🗄️ Immutable Case Store
     """)
     st.markdown("---")
@@ -387,12 +453,31 @@ with tab_cases:
                 st.rerun()
 
     cases_list = []
-    try:
-        r = requests.get(f"{API_BASE}/v1/cases?limit=50", timeout=5)
-        if r.status_code == 200:
-            cases_list = r.json().get("cases", [])
-    except Exception:
-        pass
+    # 1. First check audit_log.db
+    if os.path.exists(AUDIT_DB_PATH):
+        try:
+            with sqlite3.connect(AUDIT_DB_PATH, timeout=5.0) as conn:
+                conn.row_factory = sqlite3.Row
+                cur = conn.cursor()
+                cur.execute("""
+                    SELECT id as case_id, timestamp as created_at, account_id, risk_level, 
+                           0.95 as deterministic_score, typology as primary_typology, 
+                           recommended_action, narrative as model_reasoning, 
+                           evidence as triggered_rules_json
+                    FROM alerts ORDER BY id DESC LIMIT 50
+                """)
+                cases_list = [dict(row) for row in cur.fetchall()]
+        except Exception:
+            pass
+
+    # 2. Fallback to API and DB_FILE
+    if not cases_list:
+        try:
+            r = requests.get(f"{API_BASE}/v1/cases?limit=50", timeout=5)
+            if r.status_code == 200:
+                cases_list = r.json().get("cases", [])
+        except Exception:
+            pass
 
     if not cases_list and os.path.exists(DB_FILE):
         try:
@@ -416,24 +501,28 @@ with tab_cases:
                 "CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🟢"
             }.get(row['risk_level'], "⚪")
 
-            with st.expander(f"{risk_color} {row['case_id']} | {row['account_id']} | Risk: {row['risk_level']}"):
+            with st.expander(f"{risk_color} #{row['case_id']} | {row['account_id']} | Risk: {row['risk_level']}"):
                 c1, c2, c3 = st.columns(3)
-                c1.metric("Deterministic Risk Score", f"{float(row['deterministic_score']):.2f}")
+                det_score = float(row.get('deterministic_score', 0.9))
+                c1.metric("Risk Score", f"{det_score:.2f}")
                 c2.write(f"**Primary Typology:** `{row['primary_typology']}`")
                 c3.write(f"**Recommended Action:** `{row['recommended_action']}`")
 
-                st.markdown("**Deterministic Triggered Rules:**")
-                raw_rules = row['triggered_rules_json']
-                rules_data = json.loads(raw_rules) if isinstance(raw_rules, str) else (raw_rules or [])
-                triggered = [r for r in rules_data if r.get('triggered')]
-                if triggered:
-                    for r in triggered:
-                        st.error(f"🚨 **{r.get('rule_name', 'Rule')}** (`{r.get('rule_id', '')}`): {r.get('reason', '')}")
-                else:
-                    st.info("No deterministic rules triggered.")
-
-                st.markdown("**SLM Contextual Reasoning & Evidence:**")
+                st.markdown("**SLM Contextual Reasoning & Narrative:**")
                 st.write(row.get('model_reasoning') or "Evaluation complete.")
+
+                raw_rules = row.get('triggered_rules_json')
+                if raw_rules:
+                    st.markdown("**Evidence & Indicators:**")
+                    try:
+                        rules_data = json.loads(raw_rules) if isinstance(raw_rules, str) else raw_rules
+                        if isinstance(rules_data, list):
+                            for r in rules_data:
+                                st.warning(f"⚠️ {r}")
+                        else:
+                            st.write(rules_data)
+                    except Exception:
+                        st.write(raw_rules)
     else:
         st.info("No cases currently recorded. Upload a CSV file or start the database poller.")
 
@@ -443,7 +532,7 @@ with tab_chat:
 
     if "chat_messages" not in st.session_state:
         st.session_state.chat_messages = [
-            {"role": "assistant", "content": "👋 Ask me about any specific account (e.g. *'Why is account 30412 flagged?'*) or request a risk overview."}
+            {"role": "assistant", "content": "👋 Ask me about any specific account (e.g. *'Why is ACC-40005 flagged?'*), query *'accounts flagged'*, or request a *'risk overview'*."}
         ]
 
     for msg in st.session_state.chat_messages:
@@ -456,11 +545,7 @@ with tab_chat:
         with st.chat_message("user"):
             st.write(prompt)
         with st.chat_message("assistant"):
-            try:
-                res = requests.post(f"{API_BASE}/v1/chat", json={"query": prompt}, timeout=15)
-                answer = res.json().get("response", "No response returned.")
-            except Exception as e:
-                answer = f"Assistant offline: {e}"
+            answer = query_compliance_assistant(prompt)
             st.markdown(answer)
             st.session_state.chat_messages.append({"role": "assistant", "content": answer})
 
@@ -469,12 +554,23 @@ with tab_metrics:
     st.header("Risk Telemetry")
     counts_data = []
 
-    try:
-        r = requests.get(f"{API_BASE}/v1/telemetry", timeout=5)
-        if r.status_code == 200:
-            counts_data = r.json().get("counts", [])
-    except Exception:
-        pass
+    # Priority 1: Read directly from audit_log.db
+    if os.path.exists(AUDIT_DB_PATH):
+        try:
+            with sqlite3.connect(AUDIT_DB_PATH, timeout=5.0) as conn:
+                df_counts = pd.read_sql("SELECT risk_level, COUNT(*) as count FROM alerts GROUP BY risk_level", conn)
+                counts_data = df_counts.to_dict(orient="records")
+        except Exception:
+            pass
+
+    # Priority 2: Try API or DB_FILE
+    if not counts_data:
+        try:
+            r = requests.get(f"{API_BASE}/v1/telemetry", timeout=5)
+            if r.status_code == 200:
+                counts_data = r.json().get("counts", [])
+        except Exception:
+            pass
 
     if not counts_data and os.path.exists(DB_FILE):
         try:
@@ -571,7 +667,7 @@ with tab_poller:
                             st.info(f"0 pending transactions found in `{resolved_db}`:`{target_table}`. All records are already SCREENED or the table is empty.")
 
     with col_stop:
-        if st.button("⏹️ Stop Poller", disabled=not is_running(), use_container_width=True):
+        if st.button("⏹️️ Stop Poller", disabled=not is_running(), use_container_width=True):
             stop_poller()
             st.rerun()
 
