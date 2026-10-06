@@ -18,14 +18,17 @@ from service.db_poller import (
 )
 from service.cases import (
     log_upload_batch, get_upload_history, delete_upload_batch,
-    purge_all_records, DB_FILE
+    purge_all_records, DB_FILE, init_case_storage
 )
 
 API_BASE = os.getenv("VIGILANCE_API_URL", "http://localhost:8000")
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 AUDIT_DB_PATH = os.path.join(BASE_DIR, "audit_log.db")
 
+init_case_storage(DB_FILE)
+
 st.set_page_config(page_title="VigilanceAI — Compliance Workstation", page_icon="🛡️", layout="wide")
+
 
 def fast_purge_cases():
     """Wipes all screening data via API and local SQLite fallback, then clears cache."""

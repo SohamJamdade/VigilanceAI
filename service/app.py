@@ -144,12 +144,11 @@ def _build_quantized_model(variant: str):
 
 
 def load_slm():
-    """Load the requested variant; if its checkpoint is missing or incompatible,
-    fall back to the 15M model. The architecture always matches the checkpoint used."""
-    requested = SLM_VARIANT if SLM_VARIANT in MODEL_CONFIGS else "130m"
-    if requested != SLM_VARIANT:
-        print(f"[!] Unknown SLM_VARIANT '{SLM_VARIANT}'. Using '{requested}'.")
+    requested = os.getenv("SLM_VARIANT", "130m").strip().lower()
+    if requested not in MODEL_CONFIGS:
+        requested = "130m"
     order = [requested] + (["15m"] if requested != "15m" else [])
+
 
     for variant in order:
         ckpt = CKPT_MAP[variant]

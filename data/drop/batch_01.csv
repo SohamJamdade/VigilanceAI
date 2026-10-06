@@ -1,3 +1,0 @@
-﻿tx_id,account_id,amount,currency,rail,recipient,device_id,timestamp,location
-TX-DROP-001,ACC-DROP-99,49200.0,INR,IMPS,Mule Recipient,DEV-01,2026-09-30T16:00:00Z,DOMESTIC
-TX-DROP-002,ACC-DROP-99,48950.0,INR,IMPS,Mule Recipient,DEV-01,2026-09-30T16:02:00Z,DOMESTIC

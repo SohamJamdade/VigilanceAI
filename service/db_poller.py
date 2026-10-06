@@ -13,6 +13,7 @@ if BASE_DIR not in sys.path:
     sys.path.append(BASE_DIR)
 
 from service.app import screen_account_hybrid, load_slm
+from service.cases import init_case_storage, DB_FILE
 
 DB_PATH = os.path.join(BASE_DIR, "core_banking.db")
 AUDIT_DB_PATH = os.path.join(BASE_DIR, "audit_log.db")
@@ -30,6 +31,7 @@ poller_telemetry: Dict[str, Any] = {
 
 
 def init_audit_db(audit_db_file: str = AUDIT_DB_PATH):
+    init_case_storage(audit_db_file)
     with sqlite3.connect(audit_db_file, timeout=5.0) as conn:
         cur = conn.cursor()
         cur.execute("""
@@ -45,6 +47,7 @@ def init_audit_db(audit_db_file: str = AUDIT_DB_PATH):
             )
         """)
         conn.commit()
+
 
 
 def poll_and_screen(db_path: str = DB_PATH, table: str = "transactions", audit_db_path: str = AUDIT_DB_PATH) -> int:
@@ -234,10 +237,13 @@ def is_running() -> bool:
 
 if __name__ == "__main__":
     print("[*] Starting VigilanceAI Database Screening Poller...", flush=True)
+    init_case_storage(AUDIT_DB_PATH)
+    init_audit_db(AUDIT_DB_PATH)
     load_slm()
     while True:
         try:
             poll_and_screen()
         except Exception as e:
             print(f"[!] Error in poller cycle: {e}", flush=True)
+
         time.sleep(3)
