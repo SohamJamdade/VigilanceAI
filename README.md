@@ -1,4 +1,4 @@
-# VigilanceAI: Automated, SLM-Driven Anti-Money Laundering (AML) Pipeline
+# VigilanceAI: Automated, SLM Used for Anti-Money Laundering (AML) Pipeline
 
 VigilanceAI is an enterprise-grade, automated transaction monitoring and compliance screening engine driven by a quantized Financial Small Language Model (SLM) (130M INT8). It bridges deterministic heuristic rule engines with contextual deep-learning inference to classify risk, detect advanced typologies (such as structuring, velocity bursts, and sanctions breaches), and generate audit-ready compliance dossiers.
 
